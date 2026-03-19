@@ -181,7 +181,8 @@ class GSWorldWrapper(gym.Wrapper):
         
         gs_renders = self._render_gsworld()
         for cam_name, gs_render in gs_renders.items():
-            obs['sensor_data'][cam_name]['rgb'] = gs_render
+            obs['sensor_data'][cam_name]['rgb'] = gs_render['rgb']
+            obs['sensor_data'][cam_name]['depth'] = gs_render['depth']
         
         return obs, reward, terminated, truncated, info
 
@@ -192,9 +193,11 @@ class GSWorldWrapper(gym.Wrapper):
         ##############################################
         
         gs_renders = self._render_gsworld()
+        # overwriting the env observation with obtained gs renders
         for cam_name, gs_render in gs_renders.items():
-            obs['sensor_data'][cam_name]['rgb'] = gs_render
-        
+            obs['sensor_data'][cam_name]['rgb'] = gs_render['rgb']
+            obs['sensor_data'][cam_name]['depth'] = gs_render['depth']
+
         return obs, info
 
     def render(self):
@@ -219,7 +222,8 @@ class GSWorldWrapper(gym.Wrapper):
 
         gs_renders = self._render_gsworld()
         for cam_name, gs_render in gs_renders.items():
-            obs['sensor_data'][cam_name]['rgb'] = gs_render
+            obs['sensor_data'][cam_name]['rgb'] = gs_render['rgb']
+            obs['sensor_data'][cam_name]['depth'] = gs_render['depth']
         
         return (
             obs,
@@ -239,6 +243,7 @@ class GSWorldWrapper(gym.Wrapper):
         for cam_name, cam_param in self.gs_cam.items():
             if renderer == 'gaussian-splatting':
                 cam_name_rendering = []
+                cam_name_depth = []
                 for i in range(self.num_envs):
                     # prepare gaussian model
                     gs4render = copy.deepcopy(self.initial_merger_robot)
@@ -263,15 +268,26 @@ class GSWorldWrapper(gym.Wrapper):
                                 torch.isin(gs4render._semantics.long().squeeze(-1), 
                                 torch.tensor(self.gs_semantics[key], 
                                 device=gs4render._semantics.device).long())] = self.gs_movable_pts[key][3][i]
-                    rendering = render(cam_param, gs4render, self.robot_pipe, background, 
-                                    use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)["render"]
+                    output = render(cam_param, gs4render, self.robot_pipe, background, 
+                                    use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
+                    rendering = output["render"].detach()
                     gs_render = rendering.permute(1, 2, 0).unsqueeze(dim=0)
                     # Convert gs_render from [0,1] float32 to [0,255] uint8
                     cam_name_rendering.append((gs_render * 255).clamp(0, 255).to(torch.uint8))
+
+                    # Depth 
+                    depth = output["depth"].detach()
+                    depth = depth.permute(1, 2, 0).unsqueeze(dim=0)
+                    cam_name_depth.append(depth)
             else:
                 return ValueError(f"{renderer} is not supported. Official renderer also supports gsplat.")
-            gs_renders.update({cam_name: torch.vstack(cam_name_rendering)}) # (num_envs, H, W, 3)
-        
+            gs_renders.update({
+                cam_name: {
+                "rgb": torch.vstack(cam_name_rendering),      # (num_envs, H, W, 3)
+                "depth": torch.vstack(cam_name_depth)         # (num_envs, H, W, 1)
+                }
+            })    
+
         return gs_renders
         
     def cam_maniskill2gs(self, config_maniskill: dict, device: Union[str, torch.device], cam_names: list) -> Camera:
