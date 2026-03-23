@@ -8,7 +8,7 @@ import torch
 import os
 
 from gsworld.constants import ASSET_DIR
-from gsworld.mani_skill.utils.wrappers import Semantic3DGSWrapper
+
 
 class GaussianModelMerger:
     """
@@ -177,6 +177,7 @@ class GaussianModelMerger:
         transformation = model_config.get("transformation", None)
             
         # Load the model
+        from gsworld.mani_skill.utils.wrappers.semantic_3dgs_wrapper import Semantic3DGSWrapper
         model = Semantic3DGSWrapper(3)
         model.load_ply(ply_path)
         
@@ -231,6 +232,7 @@ class GaussianModelMerger:
         print(f"Merging {len(models_to_merge)} models: {', '.join(paths_to_merge)}")
         
         # Create a new model for the merged result
+        from gsworld.mani_skill.utils.wrappers.semantic_3dgs_wrapper import Semantic3DGSWrapper
         merged_model = Semantic3DGSWrapper(3)
         
         # Initialize lists to store combined attributes

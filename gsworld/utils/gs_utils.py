@@ -279,92 +279,76 @@ def rotate_gaussian(gaussians, rot_mat, selected_indices):
     return selected_pts, r_out # xyz, quat
 
 
-# unified batched transformation
 def transform_gaussians(
     gaussians,
     selected_indices,
     scale=None,              # scalar or (B,)
-    rot_mat=None,            # (1,3,3), (N,3,3), or (B,3,3)
-    translation=None,        # (3,) or (B,3)
+    rot_mat=None,            # (3, 3), (N, 3, 3), or (B, 3, 3)
+    translation=None,        # (3,) or (B, 3)
     new_opacity=None         # scalar or (B,)
 ):
     """
     Apply transformations to selected Gaussians in the order:
     [scale -> rotate -> translate -> change opacity].
-
-    Returns:
-        xyz_out: (N, 3) or (B, N, 3)
-        scaling_out: (N, 3) or (B, N, 3)
-        rotation_out: (N, 4) or (B, N, 4)
-        opacity_out: (N,) or (B, N)
+    Fully supports unbatched, point-batched (N), and env-batched (B) transformations seamlessly.
     """
     xyz = gaussians._xyz[selected_indices]            # (N, 3)
     scaling = gaussians._scaling[selected_indices]    # (N, 3)
     rotation = gaussians._rotation[selected_indices]  # (N, 4)
-    opacities = gaussians._opacity[selected_indices]  # (N,)
+    opacities = gaussians._opacity[selected_indices]  # (N, ...)
 
     # ================= Scale =================
     if scale is not None:
         if scale.dim() == 0:  # scalar
             xyz = xyz * scale
             scaling = inverse_sigmoid(torch.exp(scaling) * scale)
-        elif scale.dim() == 1:  # (B,)
-            B, N, D = scale.size(0), xyz.size(0), scaling.size(1)
-            xyz = xyz.unsqueeze(0).expand(B, N, 3) * scale[:, None, None]
-            scaling = inverse_sigmoid(
-                torch.exp(scaling.unsqueeze(0).expand(B, N, 3)) * scale[:, None, None]
-            )
-        else:
-            raise ValueError(f"Unexpected scale shape {scale.shape}")
+        elif scale.dim() == 1:  # (B,) or (N,)
+            if scale.size(0) == xyz.size(-2) and xyz.dim() == 2: # (N,) point-specific
+                xyz = xyz * scale.unsqueeze(1)
+                scaling = inverse_sigmoid(torch.exp(scaling) * scale.unsqueeze(1))
+            else: # (B,) env-batched
+                xyz = xyz.unsqueeze(0) * scale.view(-1, 1, 1)
+                scaling = inverse_sigmoid(torch.exp(scaling).unsqueeze(0) * scale.view(-1, 1, 1))
 
     # ================= Rotate =================
     if rot_mat is not None:
-        quat_r = matrix_to_quaternion(rot_mat)
-
-        if rot_mat.size(0) == 1:  # one rotation for all points
-            if xyz.dim() == 2:  # (N,3)
-                rot_exp = rot_mat.expand(xyz.size(0), 3, 3)
-                xyz = torch.bmm(rot_exp, xyz.unsqueeze(-1)).squeeze(-1)
-            else:  # (B,N,3)
-                B, N = xyz.shape[:2]
-                rot_exp = rot_mat.expand(B, N, 3, 3)
-                xyz = torch.matmul(rot_exp, xyz.unsqueeze(-1)).squeeze(-1)
-
-        elif rot_mat.size(0) == xyz.size(0) and xyz.dim() == 2:
-            xyz = torch.bmm(rot_mat, xyz.unsqueeze(-1)).squeeze(-1)
-        else:  # (B,3,3) applied to all N
-            B, N = rot_mat.size(0), xyz.size(-2)
-            pts = xyz if xyz.dim() == 3 else xyz.unsqueeze(0).expand(B, N, 3)
-            rot_exp = rot_mat.unsqueeze(1).expand(B, N, 3, 3)
-            xyz = torch.matmul(rot_exp, pts.unsqueeze(-1)).squeeze(-1)
-
-        # rotations
-        if rotation.numel() > 0:
-            # if quat_r.size(0) == 1: # TODO bug
-            #     r_out = get_gaussian_rotation_quat_pytorch3d(quat_r.expand(rotation.size(0), 4), rotation)
-            if quat_r.size(0) == rotation.size(0) and xyz.dim() == 2:
-                r_out = get_gaussian_rotation_quat_pytorch3d(quat_r, rotation)
-            else:  # B rotations applied to all N
-                B, N = quat_r.size(0), rotation.size(0)
-                quat_r_exp = quat_r[:, None, :].expand(B, N, 4)
-                r_exp = rotation[None, :, :].expand(B, N, 4)
-                r_out = get_gaussian_rotation_quat_pytorch3d(
-                    quat_r_exp.reshape(B * N, 4), r_exp.reshape(B * N, 4)
-                ).view(B, N, 4)
-            rotation = r_out
+        if rot_mat.dim() == 2:  # (3, 3) unbatched
+            xyz = torch.matmul(xyz, rot_mat.transpose(-1, -2))
+            quat_r = matrix_to_quaternion(rot_mat) # (4,)
+            if rotation.numel() > 0:
+                rotation = get_gaussian_rotation_quat_pytorch3d(quat_r.unsqueeze(0).expand(rotation.size(0), 4), rotation)
+                
+        elif rot_mat.dim() == 3:
+            if rot_mat.size(0) == xyz.size(-2):  # (N, 3, 3) point-specific rotation
+                # Match (B, N, 3) or (N, 3) with (N, 3, 3)
+                rot_t = rot_mat.transpose(-1, -2).unsqueeze(0) if xyz.dim() == 3 else rot_mat.transpose(-1, -2)
+                xyz = torch.matmul(xyz.unsqueeze(-2), rot_t).squeeze(-2)
+                
+                quat_r = matrix_to_quaternion(rot_mat) # (N, 4)
+                if rotation.numel() > 0:
+                    rotation = get_gaussian_rotation_quat_pytorch3d(quat_r, rotation)
+            else:  # (B, 3, 3) env-batched rotation
+                # (..., N, 3) @ (B, 1, 3, 3) -> (B, N, 3) via broadcast
+                xyz = torch.matmul(xyz, rot_mat.unsqueeze(1).transpose(-1, -2))
+                
+                quat_r = matrix_to_quaternion(rot_mat) # (B, 4)
+                if rotation.numel() > 0:
+                    B, N = quat_r.size(0), rotation.size(0)
+                    quat_r_exp = quat_r.unsqueeze(1).expand(B, N, 4)
+                    r_exp = rotation.unsqueeze(0).expand(B, N, 4)
+                    rotation = get_gaussian_rotation_quat_pytorch3d(quat_r_exp.reshape(-1, 4), r_exp.reshape(-1, 4)).view(B, N, 4)
 
     # ================= Translate =================
     if translation is not None:
         if translation.dim() == 1:  # (3,)
             xyz = xyz + translation
-        elif translation.dim() == 2:  # (B,3)
-            if xyz.dim() == 2:  # (N,3)
-                B, N = translation.size(0), xyz.size(0)
-                xyz = xyz.unsqueeze(0).expand(B, N, 3) + translation[:, None, :]
-            else:  # (B,N,3)
-                xyz = xyz + translation[:, None, :]
-        else:
-            raise ValueError(f"Unexpected translation shape {translation.shape}")
+        elif translation.dim() == 2:  # (B, 3) or (N, 3)
+            if translation.size(0) == xyz.size(-2) and xyz.dim() == 2: # (N, 3) point-specific translation
+                xyz = xyz + translation
+            else: # (B, 3) env-batched
+                if xyz.dim() == 2:
+                    xyz = xyz.unsqueeze(0)
+                xyz = xyz + translation.unsqueeze(1)
 
     # ================= Opacity =================
     if new_opacity is not None:
@@ -373,14 +357,18 @@ def transform_gaussians(
         if new_opacity.dim() == 0:  # scalar
             result = opacities.clone()
             result[mask] = new_opacity
+            opacities = result
         elif new_opacity.dim() == 1:  # (B,)
-            B, N = new_opacity.size(0), opacities.size(0)
-            result = opacities[None, :].expand(B, N).clone()
-            mask_exp = mask[None, :].expand(B, N)
-            result[mask_exp] = new_opacity[:, None].expand(B, N)[mask_exp]
-        else:
-            raise ValueError(f"Unexpected new_opacity shape {new_opacity.shape}")
-        opacities = result
+            B = new_opacity.size(0)
+            result = opacities.unsqueeze(0).expand(B, *opacities.shape).clone() # (B, N, ...)
+            mask_exp = mask.unsqueeze(0).expand(B, *mask.shape)
+            
+            # Reshape new_opacity to broadcast across trailing dims (N, 1, etc)
+            new_op_reshaped = new_opacity.view(B, *([1]*(opacities.dim())))
+            new_op_exp = new_op_reshaped.expand_as(result)
+            
+            result[mask_exp] = new_op_exp[mask_exp]
+            opacities = result
 
     return xyz, scaling, rotation, opacities
 

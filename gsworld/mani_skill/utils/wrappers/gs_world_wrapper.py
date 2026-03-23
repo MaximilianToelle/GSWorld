@@ -3,6 +3,7 @@ from typing import Union
 import gymnasium as gym
 import torch
 import os
+import time
 
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils.structs import Actor, Link
@@ -106,6 +107,21 @@ class GSWorldWrapper(gym.Wrapper):
 
         self.gs_movable_pts = dict()
 
+        # Precompute semantic masks once — these never change
+        semantics = self.initial_merger_robot._semantics.long().squeeze(-1)
+        self._semantic_masks = {}   # key -> bool mask (N,)
+        self._semantic_indices = {} # key -> index tensor for transform_gaussians
+        for link in self.env.unwrapped.agent.robot.get_links():
+            if link.name in self.gs_semantics:
+                target = torch.tensor(self.gs_semantics[link.name], device=semantics.device).long()
+                mask = torch.isin(semantics, target)
+                self._semantic_masks[link.name] = mask
+                self._semantic_indices[link.name] = torch.where(mask)[0]
+        for actor_key, sem_id in self.obj_gs_semantics.items():
+            mask = (semantics == sem_id)
+            self._semantic_masks[actor_key] = mask
+            self._semantic_indices[actor_key] = torch.where(mask)[0]
+
 
     def transform_gs_perlink(self, splats, gs_init_qpos=None, target_mat=None, eef_pos=None):
         """Transform gaussian splatting model based on robot joint states"""
@@ -118,11 +134,9 @@ class GSWorldWrapper(gym.Wrapper):
                 for i in range(3):
                     link_mat[:, i, 3] += object_offset["xarm_arm"][i]
             link_trans = self.sim2gs_arm_trans @ link_mat @ torch.linalg.inv(self.gs_link_pose_mats[idx]) @ torch.linalg.inv(self.sim2gs_arm_trans)
-            target = torch.tensor(self.gs_semantics[link.name], device=transformed_splats._semantics.device)
-            mask = torch.isin(transformed_splats._semantics.long().squeeze(-1), target.long())
             link_xyz, link_scaling, link_rotation, link_opacity = transform_gaussians(
                 transformed_splats,
-                selected_indices=torch.where(mask)[0],
+                selected_indices=self._semantic_indices[link.name],
                 scale=None,
                 rot_mat=link_trans[:, :3, :3],
                 translation=link_trans[:, :3, 3],
@@ -149,10 +163,9 @@ class GSWorldWrapper(gym.Wrapper):
                 # Extract and apply rigid transform
                 transform, scale, _, _ = extract_rigid_transform(full_transform)
 
-                indices = torch.where(transformed_splats._semantics == self.obj_gs_semantics[actor_key])[0]
                 obj_xyz, obj_scaling, obj_rotation, obj_opacity = transform_gaussians(
                     transformed_splats,
-                    selected_indices=indices,
+                    selected_indices=self._semantic_indices[actor_key],
                     scale=scale * object_scale[actor_key],
                     rot_mat=transform[:, :3, :3],
                     translation=transform[:, :3, 3],
@@ -174,12 +187,18 @@ class GSWorldWrapper(gym.Wrapper):
 
 
     def step(self, action):
+        #start = time.time() 
         obs, reward, terminated, truncated, info = self.env.step(action)
-        
+        #print(f"GS Wrapper ENV Step took: {time.time() - start}")
+
+        #start = time.time()     
         self.transform_gs_perlink(self.initial_merger_robot)
+        #print(f"Transfrom GS per Link took: {time.time() - start}")
         #######################################################################
         
+        #start = time.time() 
         gs_renders = self._render_gsworld()
+        #print(f"GS Rendering took: {time.time() - start}")
         for cam_name, gs_render in gs_renders.items():
             obs['sensor_data'][cam_name]['rgb'] = gs_render['rgb']
             obs['sensor_data'][cam_name]['depth'] = gs_render['depth']
@@ -248,26 +267,15 @@ class GSWorldWrapper(gym.Wrapper):
                     # prepare gaussian model
                     gs4render = copy.deepcopy(self.initial_merger_robot)
                     for key in self.gs_movable_pts:
+                        mask = self._semantic_masks[key]
                         if self.gs_movable_pts[key][0].shape[0] == self.num_envs:
-                            gs4render._xyz[
-                                torch.isin(gs4render._semantics.long().squeeze(-1),
-                                torch.tensor(self.gs_semantics[key],
-                                device=gs4render._semantics.device).long())] = self.gs_movable_pts[key][0][i]
+                            gs4render._xyz[mask] = self.gs_movable_pts[key][0][i]
                         if self.gs_movable_pts[key][1].shape[0] == self.num_envs:
-                            gs4render._scaling[
-                                torch.isin(gs4render._semantics.long().squeeze(-1), 
-                                torch.tensor(self.gs_semantics[key], 
-                                device=gs4render._semantics.device).long())] = self.gs_movable_pts[key][1][i]
+                            gs4render._scaling[mask] = self.gs_movable_pts[key][1][i]
                         if self.gs_movable_pts[key][2].shape[0] == self.num_envs:
-                            gs4render._rotation[
-                                torch.isin(gs4render._semantics.long().squeeze(-1), 
-                                torch.tensor(self.gs_semantics[key], 
-                                device=gs4render._semantics.device).long())] = self.gs_movable_pts[key][2][i]
+                            gs4render._rotation[mask] = self.gs_movable_pts[key][2][i]
                         if self.gs_movable_pts[key][3].shape[0] == self.num_envs:
-                            gs4render._opacity[
-                                torch.isin(gs4render._semantics.long().squeeze(-1), 
-                                torch.tensor(self.gs_semantics[key], 
-                                device=gs4render._semantics.device).long())] = self.gs_movable_pts[key][3][i]
+                            gs4render._opacity[mask] = self.gs_movable_pts[key][3][i]
                     output = render(cam_param, gs4render, self.robot_pipe, background, 
                                     use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
                     rendering = output["render"].detach()
