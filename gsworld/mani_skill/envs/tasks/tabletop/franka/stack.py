@@ -8,6 +8,8 @@ from mani_skill import ASSET_DIR
 from mani_skill.agents.robots.fetch.fetch import Fetch
 from mani_skill.agents.robots.panda.panda import Panda
 from gsworld.mani_skill.agents.robots.panda.fr3_umi import Fr3Umi
+from gsworld.mani_skill.agents.robots.panda.fr3_umi_wrist435 import Fr3UmiWrist435
+from gsworld.mani_skill.agents.robots.panda.fr3_umi_wrist435_w_mount import Fr3UmiWrist435CamMount
 from mani_skill.agents.robots.panda.panda_wristcam import PandaWristCam
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.utils.randomization.pose import random_quaternions
@@ -29,8 +31,8 @@ WARNED_ONCE = False
 
 @register_env("StackFr3Env-v1", max_episode_steps=100, asset_download_ids=["ycb"])
 class StackFr3Env(RealFr3):
-    SUPPORTED_ROBOTS = ["fr3_umi", "fr3_umi_wrist435"]
-    agent: Union[Panda, PandaWristCam, Fetch, Fr3Umi]
+    SUPPORTED_ROBOTS = ["fr3_umi", "fr3_umi_wrist435", "fr3_umi_wrist435_cam_mount"]
+    agent: Union[Panda, PandaWristCam, Fetch, Fr3Umi, Fr3UmiWrist435, Fr3UmiWrist435CamMount]
     goal_thresh = 0.025
 
     def __init__(
@@ -117,56 +119,72 @@ class StackFr3Env(RealFr3):
             from transforms3d.euler import euler2quat
             import math
             
-            red_can_rotate_fix = quaternion_multiply(
-                axis_angle_to_quaternion(axis_angle=torch.tensor([0.0, 0.0, torch.pi / 4])), 
-                axis_angle_to_quaternion(axis_angle=torch.tensor([torch.pi / 2, 0.0, 0.0]))
-            )
-            
             b = len(env_idx)
             self.table_scene.initialize(env_idx)
-            # add noise
-            obj_xyz_0 = torch.zeros((b, 3))
-            # torch rand is [0, 1)
-            obj_xyz_0[:, 0] = -0.125 + torch.rand(b) * 0.125 + self.x_offset # 0 to -0.25
-            obj_xyz_0[:, 1] = 0.1 + abs(torch.rand((b))) * 0.1    #-0.2 to 0
-            obj_xyz_0[:, 2] = self.obj_height # self.object_zs[env_idx] TODO
-            obj_qs_0 = random_quaternions(b, lock_x=True, lock_y=True)
- 
-
-            goal_xyz_0 = torch.zeros((b, 3))
-            goal_xyz_0[:, 0] = torch.rand((b)) * 0.2 - 0.25 + self.x_offset # 
-            goal_xyz_0[:, 1] =  obj_xyz_0[:, 1] - 0.15 -  abs(torch.rand((b))) * 0.1  # seperate by 0.15 to 0.25
-            goal_xyz_0[:, 2] = self.goal_height # self.goal_height # * 0.5 # put it on the table, hard code from human render mode
-
-
-            print(obj_xyz_0[:, 1] - goal_xyz_0[:, 1], "\n\n\n")
-            goal_qs = random_quaternions(b, lock_x=True, lock_y=True)
-            obj_xyz_0[:, :2], goal_xyz_0[:, :2] = goal_xyz_0[:, :2].clone(), obj_xyz_0[:, :2].clone()
-
-            def convert_to_sapien_pose(p, q):
-                if p.shape[0] != 1:
-                    raise NotImplementedError("This function needs to be implemented.")
-                p = p[0]
-                q = q[0]
-                return sapien.Pose(p=[p[0], p[1], p[2]], q=[q[0], q[1], q[2], q[3]])
             
-            print(f"obj pose {obj_xyz_0} {obj_qs_0}, goal pose {goal_xyz_0}")
-            
-            self._objs[0].set_pose(Pose.create_from_pq(p=obj_xyz_0, q=red_can_rotate_fix))
-            self.goal_site.set_pose(Pose.create_from_pq(p=goal_xyz_0))  # Red can (cylinder)
+            # Apply initialization from dataset if provided
+            using_dataset_poses = False
+            if options is not None and 'init_state' in options and options['init_state'] is not None:
+                init_state = options['init_state']
+                
+                if 'actor_poses' in init_state and 'agent_pos' in init_state:
+                    red_can_key = 'actor_pose_dtc_red_tomato_can_fr3'
+                    goal_key = 'actor_pose_005_tomato_soup_can'
+                    
+                    if red_can_key in init_state['actor_poses'] and goal_key in init_state['actor_poses']:
+                        using_dataset_poses = True
+                        
+                        pose = torch.tensor(init_state['actor_poses'][red_can_key]).to(self.device).float()
+                        obj_xyz_0 = pose[:3].unsqueeze(0).repeat(b, 1)
+                        red_can_rotate_fix = pose[3:7].unsqueeze(0).repeat(b, 1)
+                        
+                        pose_g = torch.tensor(init_state['actor_poses'][goal_key]).to(self.device).float()
+                        goal_xyz_0 = pose_g[:3].unsqueeze(0).repeat(b, 1)
+                        goal_qs = pose_g[3:7].unsqueeze(0).repeat(b, 1)
 
-            if self.robot_uids in ["panda", "panda_wristcam"]:
-                qpos = np.array([0.0, 0, 0, -np.pi * 2 / 3, 0, np.pi * 2 / 3, np.pi / 4, 0.04, 0.04])
-                qpos[:-2] += self._episode_rng.normal(
-                    0, self.robot_init_qpos_noise, len(qpos) - 2
+                    if using_dataset_poses:
+                        init_qpos = init_state['agent_pos'][:9]
+            
+            if not using_dataset_poses:
+                print("Initializing episode with RANDOM init poses of robot and objects!")
+
+                # generate random initial positions since they are not in init_state
+                red_can_rotate_fix = quaternion_multiply(
+                    axis_angle_to_quaternion(axis_angle=torch.tensor([0.0, 0.0, torch.pi / 4])), 
+                    axis_angle_to_quaternion(axis_angle=torch.tensor([torch.pi / 2, 0.0, 0.0]))
                 )
-                self.agent.reset(qpos)
-                self.agent.robot.set_root_pose(sapien.Pose([self.x_offset-0.615, 0, 0]))
-            elif self.robot_uids in ["fr3_umi", "fr3_umi_wrist435", "fr3_umi_wrist435_cam_mount"]:
-                self.agent.reset(fr3_umi_task_init_qpos)
-                self.agent.robot.set_root_pose(sapien.Pose([self.x_offset-0.615, 0, 0]))
-            else:
-                raise NotImplementedError(self.robot_uids)
+                
+                obj_xyz_0 = torch.zeros((b, 3))
+                obj_xyz_0[:, 0] = -0.125 + torch.rand(b) * 0.125 + self.x_offset # 0 to -0.25
+                obj_xyz_0[:, 1] = 0.1 + abs(torch.rand((b))) * 0.1    #-0.2 to 0
+                obj_xyz_0[:, 2] = self.obj_height
+                obj_qs_0 = random_quaternions(b, lock_x=True, lock_y=True)
+
+                goal_xyz_0 = torch.zeros((b, 3))
+                goal_xyz_0[:, 0] = torch.rand((b)) * 0.2 - 0.25 + self.x_offset 
+                goal_xyz_0[:, 1] = obj_xyz_0[:, 1] - 0.15 - abs(torch.rand((b))) * 0.1  # seperate by 0.15 to 0.25
+                goal_xyz_0[:, 2] = self.goal_height
+
+                goal_qs = random_quaternions(b, lock_x=True, lock_y=True)
+                obj_xyz_0[:, :2], goal_xyz_0[:, :2] = goal_xyz_0[:, :2].clone(), obj_xyz_0[:, :2].clone()
+                print(f"obj pose {obj_xyz_0} {obj_qs_0}, goal pose {goal_xyz_0} {goal_qs}")
+
+                if self.robot_uids in ["panda", "panda_wristcam"]:
+                    init_qpos = np.array([0.0, 0, 0, -np.pi * 2 / 3, 0, np.pi * 2 / 3, np.pi / 4, 0.04, 0.04])
+                    init_qpos[:-2] += self._episode_rng.normal(
+                        0, self.robot_init_qpos_noise, len(init_qpos) - 2
+                    )
+                elif self.robot_uids in ["fr3_umi", "fr3_umi_wrist435", "fr3_umi_wrist435_cam_mount"]:
+                    init_qpos = fr3_umi_task_init_qpos
+                else:  
+                    raise NotImplementedError(self.robot_uids)
+
+            # Set init poses
+            self._objs[0].set_pose(Pose.create_from_pq(p=obj_xyz_0, q=red_can_rotate_fix))
+            self.goal_site.set_pose(Pose.create_from_pq(p=goal_xyz_0, q=goal_qs))  # Red can (cylinder)
+
+            self.agent.reset(init_qpos)
+            self.agent.robot.set_root_pose(sapien.Pose([self.x_offset-0.615, 0, 0]))
 
     def evaluate(self):
         # Get positions

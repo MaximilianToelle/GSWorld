@@ -4,6 +4,9 @@ import gymnasium as gym
 import torch
 import os
 import time
+import matplotlib.pyplot as plt
+import open3d as o3d
+from functools import partial
 
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.utils.structs import Actor, Link
@@ -17,6 +20,10 @@ from gsworld.utils.pcd_utils import extract_rigid_transform
 from gsworld.utils.gs_utils import transform_gaussians
 from gsworld.constants import *
 from gsworld.utils.gaussian_merger import GaussianModelMerger
+
+import viser
+from gsworld.mani_skill.utils.gsplat_viewer.gsplat_viewer import GsplatViewer
+from gsworld.mani_skill.utils.gsplat_viewer.utils_rasterize_render import _viewer_render_fn, _on_connect
 
 from PIL import Image
 
@@ -41,6 +48,7 @@ class GSWorldWrapper(gym.Wrapper):
         log_state: bool = False,
         state_log_path: str = "./exp_log",
         cam_randomization: bool = False,
+        use_gsplat_viewer: bool = False,
     ):
         super().__init__(env)
         self.num_envs = env.num_envs
@@ -122,6 +130,51 @@ class GSWorldWrapper(gym.Wrapper):
             self._semantic_masks[actor_key] = mask
             self._semantic_indices[actor_key] = torch.where(mask)[0]
 
+        # Build Sapien segmentation ID → GS semantic ID lookup table
+        max_sapien_id = max(self.base_env.segmentation_id_map.keys()) + 1
+        self._sapien_id_to_gs_id = torch.full((max_sapien_id,), -1, dtype=torch.int16, device=self.device)
+        for sapien_id, obj in self.base_env.segmentation_id_map.items():
+            name = obj.name
+            if name in self.gs_semantics:
+                gs_id = self.gs_semantics[name]
+                if isinstance(gs_id, list):
+                    gs_id = gs_id[0]
+                self._sapien_id_to_gs_id[sapien_id] = gs_id
+            elif name in self.obj_gs_semantics:
+                self._sapien_id_to_gs_id[sapien_id] = self.obj_gs_semantics[name]
+
+        # Init Gsplat Viewer
+        self.use_gsplat_viewer = use_gsplat_viewer
+        if self.use_gsplat_viewer:
+            self.gs4viewer = {
+                "means": self.initial_merger_robot._xyz.view(-1, 3),
+                "quats": self.initial_merger_robot._rotation.view(-1, 4),
+                "scales": self.initial_merger_robot._scaling.view(-1, 3),
+                "rgb_colors": self.initial_merger_robot._features_dc.view(-1, 3),
+                "opacities": self.initial_merger_robot._opacity.view(-1),
+            }
+            server = viser.ViserServer(port=8081, verbose=False)
+            self.viewer = GsplatViewer(
+                        server=server,
+                        render_fn=lambda camera_state, render_tab_state: _viewer_render_fn(
+                            camera_state, 
+                            render_tab_state, 
+                            self.gs4viewer, 
+                            "3dgs", 
+                            device
+                        ),
+                        output_dir=None,
+                        mode="training",
+                    )
+            scene_center = (self.gs4viewer["means"].data
+                    .mean(dim=0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .tolist()
+                )
+            time.sleep(1)
+            server.on_client_connect(partial(_on_connect, server=server, scene_center=scene_center))
 
     def transform_gs_perlink(self, splats, gs_init_qpos=None, target_mat=None, eef_pos=None):
         """Transform gaussian splatting model based on robot joint states"""
@@ -185,24 +238,56 @@ class GSWorldWrapper(gym.Wrapper):
             elif isinstance(obj, Link):
                 print(f"{obj_id}: Link, name - {obj.name}")
 
-
     def step(self, action):
-        #start = time.time() 
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        #print(f"GS Wrapper ENV Step took: {time.time() - start}")
+        if self.use_gsplat_viewer:
+            while self.viewer.state == "paused":
+                time.sleep(0.01)
+            self.viewer.lock.acquire()
+            tic = time.time()
 
-        #start = time.time()     
+        obs, reward, terminated, truncated, info = self.env.step(action)
         self.transform_gs_perlink(self.initial_merger_robot)
-        #print(f"Transfrom GS per Link took: {time.time() - start}")
         #######################################################################
         
-        #start = time.time() 
         gs_renders = self._render_gsworld()
-        #print(f"GS Rendering took: {time.time() - start}")
+        # overwriting the env observation with obtained gs renders
         for cam_name, gs_render in gs_renders.items():
             obs['sensor_data'][cam_name]['rgb'] = gs_render['rgb']
-            obs['sensor_data'][cam_name]['depth'] = gs_render['depth']
-        
+            # Remap Sapien segmentation IDs to GS semantic IDs (pixel-perfect, no blending artifacts from GS)
+            sapien_seg = obs['sensor_data'][cam_name]['segmentation'].long()
+            obs['sensor_data'][cam_name]['segmentation'] = self._sapien_id_to_gs_id[sapien_seg]
+            # NOTE: taking perfect depth from sapien instead of worse gs_render depth (assumption: good alignment of gs on sapien objects)
+            
+            # saving model_matrix to simplify coordinate transformation hell later
+            obs["sensor_param"][cam_name]["gl_cam2sapien_world"] = self.env.unwrapped.scene.sensors[cam_name].camera.get_model_matrix()
+
+            # == Debug ==
+            #depth = obs['sensor_data'][cam_name]['depth'] / 1000.0  
+            #intrinsic = obs["sensor_param"][cam_name]["intrinsic_cv"]
+            #pts_world = _debug_depth_to_sapien_world_pcd(depth, intrinsic, obs["sensor_param"][cam_name]["gl_cam2sapien_world"])
+            
+            #if cam_name == "right_cam":
+            #    _debug_visualize_rgb_depth(gs_render['rgb'][0], obs['sensor_data'][cam_name]['depth'][0])
+            #    _debug_visualize_pointcloud_tensors(pts_world.reshape(-1, 3), gs_render['rgb'].reshape(-1, 3))
+            # === === ===
+
+        # Update gaussians for gsplatviewer 
+        if self.use_gsplat_viewer:
+            for key in self.gs_movable_pts:
+                mask = self._semantic_masks[key]
+                self.gs4viewer["means"][mask] = self.gs_movable_pts[key][0].view(-1, 3)
+                self.gs4viewer["scales"][mask] = self.gs_movable_pts[key][1].view(-1, 3)
+                self.gs4viewer["quats"][mask] = self.gs_movable_pts[key][2].view(-1, 4)
+                self.gs4viewer["opacities"][mask] = self.gs_movable_pts[key][3].view(-1)
+
+            self.viewer.rerender(None)
+            self.viewer.lock.release()
+            num_train_rays_per_step = (3 * 540 * 960)
+            num_train_steps_per_sec = 1.0 / (max(time.time() - tic, 1e-10))
+            num_train_rays_per_sec = (num_train_rays_per_step * num_train_steps_per_sec)
+            self.viewer.render_tab_state.num_train_rays_per_sec = (num_train_rays_per_sec)
+            self.viewer.update(info['elapsed_steps'].item(), num_train_rays_per_step)  
+
         return obs, reward, terminated, truncated, info
 
     def reset(self, *, seed=None, options=None):
@@ -215,7 +300,11 @@ class GSWorldWrapper(gym.Wrapper):
         # overwriting the env observation with obtained gs renders
         for cam_name, gs_render in gs_renders.items():
             obs['sensor_data'][cam_name]['rgb'] = gs_render['rgb']
-            obs['sensor_data'][cam_name]['depth'] = gs_render['depth']
+            # Remap Sapien segmentation IDs to GS semantic IDs (pixel-perfect, no blending artifacts from GS)
+            sapien_seg = obs['sensor_data'][cam_name]['segmentation'].long()
+            obs['sensor_data'][cam_name]['segmentation'] = self._sapien_id_to_gs_id[sapien_seg]
+            
+            obs["sensor_param"][cam_name]["gl_cam2sapien_world"] = self.env.unwrapped.scene.sensors[cam_name].camera.get_model_matrix()
 
         return obs, info
 
@@ -242,7 +331,11 @@ class GSWorldWrapper(gym.Wrapper):
         gs_renders = self._render_gsworld()
         for cam_name, gs_render in gs_renders.items():
             obs['sensor_data'][cam_name]['rgb'] = gs_render['rgb']
-            obs['sensor_data'][cam_name]['depth'] = gs_render['depth']
+            # Remap Sapien segmentation IDs to GS semantic IDs (pixel-perfect, no blending artifacts from GS)
+            sapien_seg = obs['sensor_data'][cam_name]['segmentation'].long()
+            obs['sensor_data'][cam_name]['segmentation'] = self._sapien_id_to_gs_id[sapien_seg]
+
+            obs["sensor_param"][cam_name]["gl_cam2sapien_world"] = self.env.unwrapped.scene.sensors[cam_name].camera.get_model_matrix()
         
         return (
             obs,
@@ -285,14 +378,15 @@ class GSWorldWrapper(gym.Wrapper):
 
                     # Depth 
                     depth = output["depth"].detach()
+                    depth = depth / self.scale_sim2real   # NOTE: important to get depth back in SAPIEN metrics!!
                     depth = depth.permute(1, 2, 0).unsqueeze(dim=0)
                     cam_name_depth.append(depth)
             else:
                 return ValueError(f"{renderer} is not supported. Official renderer also supports gsplat.")
             gs_renders.update({
                 cam_name: {
-                "rgb": torch.vstack(cam_name_rendering),      # (num_envs, H, W, 3)
-                "depth": torch.vstack(cam_name_depth)         # (num_envs, H, W, 1)
+                "rgb": torch.vstack(cam_name_rendering),   # (num_envs, H, W, 3)
+                "depth": torch.vstack(cam_name_depth),     # (num_envs, H, W, 1)
                 }
             })    
 
@@ -347,3 +441,122 @@ class GSWorldWrapper(gym.Wrapper):
             cam_params.update({cam_name: cam_param})
 
         return cam_params
+
+
+def _debug_depth_to_sapien_world_pcd(depth, intrinsic, gl_cam2sapien_world):
+    """
+    Converts batched depth to pcd in sapien world coordinates assuming graphics convention (x-axis right, y-axis upward, z-axis backward) in extrinsics. 
+    All inputs/outputs are torch tensors on the same device.
+    """
+    
+    B, H, W = depth.shape[:3]
+    device = depth.device
+
+    u, v = torch.meshgrid(torch.arange(W, device=device, dtype=depth.dtype) + 0.5,  # half-pixel offset to model pixel center depth
+                          torch.arange(H, device=device, dtype=depth.dtype) + 0.5,
+                          indexing='xy')
+
+    fx, fy = intrinsic[:, 0, 0].view(B, 1, 1), intrinsic[:, 1, 1].view(B, 1, 1)
+    cx, cy = intrinsic[:, 0, 2].view(B, 1, 1), intrinsic[:, 1, 2].view(B, 1, 1)
+
+    d = depth[..., 0]
+    
+    z = - d     # assuming positive depth values
+    x = (u - cx) * d / fx   # X is right -> (u - cx) is positive on the right
+    y = -(v - cy) * d / fy   # Y is upward -> (v - cy) is positive downward!
+
+    pts_cam = torch.stack([x, y, z], dim=-1).reshape(B, -1, 3)
+
+    rotation_mats = gl_cam2sapien_world[:, :3, :3]
+    translation_vecs = gl_cam2sapien_world[:, :3, 3].unsqueeze(1)
+    
+    pts_world = torch.matmul(pts_cam, rotation_mats.transpose(-2, -1)) + translation_vecs
+
+    return pts_world
+
+
+def _debug_visualize_pointcloud_tensors(merged_pts: torch.Tensor, merged_rgb: torch.Tensor) -> None:
+    """
+    Quickly visualizes GPU point cloud tensors using Open3D.
+    """
+    # 1. Detach from graph, move to CPU, and convert to contiguous NumPy arrays
+    #    Using .contiguous() ensures memory layout compatibility with Open3D
+    pts_np = merged_pts.detach().cpu().contiguous().numpy()
+    rgb_np = merged_rgb.detach().cpu().contiguous().numpy()
+
+    # 2. Normalize colors to [0.0, 1.0] if they are in [0, 255]
+    #    Open3D expects float64 colors in the [0, 1] range.
+    if rgb_np.max() > 1.0 or rgb_np.dtype == np.uint8:
+        rgb_np = rgb_np.astype(np.float64) / 255.0
+    else:
+        rgb_np = rgb_np.astype(np.float64)
+
+    # 3. Cast points to float64 (Open3D Vector3dVector requirement)
+    pts_np = pts_np.astype(np.float64)
+
+    # 4. Instantiate the Open3D PointCloud object
+    pcd = o3d.geometry.PointCloud()
+    
+    # 5. Assign vertices and colors via Open3D's utility vectors
+    pcd.points = o3d.utility.Vector3dVector(pts_np)
+    # pcd.colors = o3d.utility.Vector3dVector(rgb_np)
+
+    # 6. Launch the interactive visualizer (this will block execution until closed)
+    print(f"Visualizing {pts_np.shape[0]} points. Close the window to continue execution.")
+    o3d.visualization.draw_geometries([pcd])
+
+
+def _debug_visualize_rgb_depth(
+    rgb: torch.Tensor | np.ndarray, 
+    depth: torch.Tensor | np.ndarray
+) -> None:
+    """
+    Visualizes RGB and Depth images side-by-side.
+    Safely handles PyTorch tensors (GPU/CPU) and NumPy arrays.
+    """
+    # 1. Convert PyTorch tensors to NumPy arrays safely
+    if isinstance(rgb, torch.Tensor):
+        rgb_np = rgb.detach().cpu().numpy()
+    else:
+        rgb_np = rgb
+        
+    if isinstance(depth, torch.Tensor):
+        depth_np = depth.detach().cpu().numpy()
+    else:
+        depth_np = depth
+
+    # 2. Handle shapes
+    # Squeeze depth from (H, W, 1) to (H, W) for matplotlib
+    if depth_np.ndim == 3 and depth_np.shape[-1] == 1:
+        depth_np = depth_np.squeeze(-1)
+        
+    # Ensure RGB is (H, W, 3) just in case it was passed as (C, H, W)
+    if rgb_np.ndim == 3 and rgb_np.shape[0] == 3: 
+        rgb_np = np.transpose(rgb_np, (1, 2, 0))
+        
+    # 3. Handle data ranges for RGB
+    # Matplotlib expects float arrays to be strictly in [0.0, 1.0]
+    if rgb_np.dtype != np.uint8:
+        rgb_np = np.clip(rgb_np, 0.0, 1.0)
+
+    # 4. Create the plot
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    
+    # Plot RGB
+    axes[0].imshow(rgb_np)
+    axes[0].set_title("RGB Image")
+    axes[0].axis('off')
+    
+    # Plot Depth
+    # Using 'plasma' or 'viridis' helps differentiate subtle depth changes
+    # where the "smearing" artifacts usually hide.
+    im_depth = axes[1].imshow(depth_np, cmap='plasma') 
+    axes[1].set_title("Depth Map")
+    axes[1].axis('off')
+    
+    # Add a colorbar to read the exact depth values
+    cbar = fig.colorbar(im_depth, ax=axes[1], fraction=0.046, pad=0.04)
+    cbar.set_label('Depth')
+    
+    plt.tight_layout()
+    plt.show() 

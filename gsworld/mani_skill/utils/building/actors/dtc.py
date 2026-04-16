@@ -23,7 +23,7 @@ def get_dtc_builder(
     builder = scene.create_actor_builder()
 
     metadata = model_db[id]
-    density = 10 # metadata.get("density", 1000)
+    density = metadata.get("density", 1000)
     model_scales = metadata.get("scales", [1.0])
     scale = model_scales[0]
     physical_material = None

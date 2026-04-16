@@ -373,6 +373,75 @@ def transform_gaussians(
     return xyz, scaling, rotation, opacities
 
 
+def transform_batched_gaussians(
+    gaussians,
+    selected_indices,       # (N,)
+    scale,                  # (T, N)
+    rot_mat,                # (T, N, 3, 3)
+    translation,            # (T, N, 3)
+):
+    """
+    Time-batched version of transform_gaussians for the per-Gaussian, per-timestep case.
+    
+    Applies transformations to selected Gaussians in the order:
+    [scale -> rotate -> translate] (same as transform_gaussians).
+    
+    This follows the EXACT same logic as the point-specific (N,) code paths in 
+    transform_gaussians, but with an additional leading time dimension T.
+    All operations (matmul, matrix_to_quaternion, quaternion_multiply, norm) 
+    natively support arbitrary (...) batch dimensions, so no flatten/reshape is needed.
+    
+    Args:
+        gaussians: GaussianModel with _xyz, _scaling, _rotation, _opacity attributes
+        selected_indices: (N,) index tensor selecting which Gaussians to transform
+        scale: (T, N) per-timestep, per-Gaussian scale factors
+        rot_mat: (T, N, 3, 3) per-timestep, per-Gaussian rotation matrices
+        translation: (T, N, 3) per-timestep, per-Gaussian translations
+    
+    Returns:
+        xyz: (T, N, 3) transformed positions
+        scaling: (T, N, 3) transformed log-scales
+        rotation: (T, N, 4) transformed quaternions
+        opacities: (T, N, ...) unchanged opacities (broadcast over T)
+    """
+    # Read initial Gaussian params once — (N, ...)
+    init_xyz = gaussians._xyz[selected_indices]            # (N, 3)
+    init_scaling = gaussians._scaling[selected_indices]    # (N, 3)
+    init_rotation = gaussians._rotation[selected_indices]  # (N, 4)
+    opacities = gaussians._opacity[selected_indices]       # (N, ...)
+    
+    T = scale.size(0)
+
+    # ================= Scale =================
+    # Same as point-specific path: xyz = xyz * scale.unsqueeze(1)
+    # but broadcast (N, 3) over T via unsqueeze(0)
+    xyz = init_xyz.unsqueeze(0) * scale.unsqueeze(-1)                          # (T, N, 3)
+    scaling = inverse_sigmoid(
+        torch.exp(init_scaling).unsqueeze(0) * scale.unsqueeze(-1)             # (T, N, 3)
+    )
+
+    # ================= Rotate =================
+    # Same as point-specific path: matmul(xyz.unsqueeze(-2), rot_t).squeeze(-2)
+    rot_t = rot_mat.transpose(-1, -2)                                          # (T, N, 3, 3)
+    xyz = torch.matmul(xyz.unsqueeze(-2), rot_t).squeeze(-2)                   # (T, N, 3)
+    
+    # Quaternion composition — same as get_gaussian_rotation_quat_pytorch3d
+    # but with (T, N, 4) inputs; all ops use dim=-1 so batch dims are transparent
+    quat_r = matrix_to_quaternion(rot_mat)                                     # (T, N, 4)
+    r = init_rotation.unsqueeze(0).expand(T, -1, -1)                           # (T, N, 4)
+    rotation = get_gaussian_rotation_quat_pytorch3d(quat_r, r)                 # (T, N, 4)
+
+    # ================= Translate =================
+    # Same as point-specific path: xyz = xyz + translation
+    xyz = xyz + translation                                                    # (T, N, 3)
+
+    # ================= Opacity =================
+    # No change, just broadcast over T
+    opacities = opacities.unsqueeze(0).expand(T, *opacities.shape)             # (T, N, ...)
+
+    return xyz, scaling, rotation, opacities
+
+
 def is_rigid_transformation(T: torch.Tensor, tol: float = 1e-5):
     if T.ndim == 2 and T.shape == (4, 4):
         T = T.unsqueeze(0)  # promote to (1,4,4)

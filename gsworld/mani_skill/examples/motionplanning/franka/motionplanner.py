@@ -57,6 +57,8 @@ class FR3UmiMotionPlanningSolver:
         self.collision_pts_changed = False
         self.all_collision_pts = None
 
+        self.last_arm_qpos = None
+
     def render_wait(self):
         if not self.vis or not self.debug:
             return
@@ -103,6 +105,8 @@ class FR3UmiMotionPlanningSolver:
                 )
             if self.vis:
                 self.base_env.render_human()
+
+        self.last_arm_qpos = result["position"][-1]
         return obs, reward, terminated, truncated, info
 
     def move_to_pose_with_RRTConnect(
@@ -158,32 +162,51 @@ class FR3UmiMotionPlanningSolver:
             return result
         return self.follow_path(result, refine_steps=refine_steps)
 
-    def open_gripper(self):
+    def open_gripper(self, t: int = 15):
+        start_state = self.gripper_state
         self.gripper_state = OPEN
-        qpos = self.robot.get_qpos()[0, :-2].cpu().numpy()
-        for i in range(6):
+        
+        if self.last_arm_qpos is not None:
+            arm_qpos = self.last_arm_qpos
+        else:
+            arm_qpos = self.robot.get_qpos()[0, :-2].cpu().numpy()
+        interpolated_gripper_actions = np.linspace(start_state, OPEN, t)
+        
+        for current_gripper_action in interpolated_gripper_actions:
             if self.control_mode == "pd_joint_pos":
-                action = np.hstack([qpos, self.gripper_state])
+                action = np.hstack([arm_qpos, current_gripper_action])
             else:
-                action = np.hstack([qpos, qpos * 0, self.gripper_state])
+                action = np.hstack([arm_qpos, arm_qpos * 0, current_gripper_action])
+                
             obs, reward, terminated, truncated, info = self.env.step(action)
             self.elapsed_steps += 1
+            
             if self.print_env_info:
-                print(
-                    f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}"
-                )
+                print(f"[{self.elapsed_steps:3}] Env Output: reward={reward} info={info}")
             if self.vis:
                 self.base_env.render_human()
+
         return obs, reward, terminated, truncated, info
 
-    def close_gripper(self, t=6, gripper_state = CLOSED):
-        self.gripper_state = gripper_state
-        qpos = self.robot.get_qpos()[0, :-2].cpu().numpy()
-        for i in range(t):
+    def close_gripper(self, t: int = 15):
+        start_state = self.gripper_state
+        self.gripper_state = CLOSED
+
+        if self.last_arm_qpos is not None:
+            arm_qpos = self.last_arm_qpos
+        else:
+            arm_qpos = self.robot.get_qpos()[0, :-2].cpu().numpy()
+        
+        # Generate interpolated gripper actions
+        # Ramps from current state (e.g. 1) to target state (-1)
+        interpolated_gripper_actions = np.linspace(start_state, self.gripper_state, t)
+        
+        # Smooth Closing
+        for current_gripper_action in interpolated_gripper_actions:
             if self.control_mode == "pd_joint_pos":
-                action = np.hstack([qpos, self.gripper_state])
+                action = np.hstack([arm_qpos, current_gripper_action])
             else:
-                action = np.hstack([qpos, qpos * 0, self.gripper_state])
+                action = np.hstack([arm_qpos, arm_qpos * 0, current_gripper_action])
             obs, reward, terminated, truncated, info = self.env.step(action)
             self.elapsed_steps += 1
             if self.print_env_info:
@@ -192,6 +215,7 @@ class FR3UmiMotionPlanningSolver:
                 )
             if self.vis:
                 self.base_env.render_human()
+
         return obs, reward, terminated, truncated, info
 
     def add_box_collision(self, extents: np.ndarray, pose: sapien.Pose):

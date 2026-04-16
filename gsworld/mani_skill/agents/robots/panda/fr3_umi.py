@@ -60,7 +60,7 @@ class Fr3Umi(BaseAgent): # register and allow env.make
 
     gripper_stiffness = 1e3
     gripper_damping = 1e2
-    gripper_force_limit = 100
+    gripper_force_limit = 100      
 
     @property
     def _controller_configs(self):
@@ -113,7 +113,7 @@ class Fr3Umi(BaseAgent): # register and allow env.make
         # Gripper controller
         gripper_pd_joint_pos = PDJointPosMimicControllerConfig(
             self.gripper_joint_names,
-            lower=-0.01,
+            lower=-0.01,    
             upper=0.04,
             stiffness=self.gripper_stiffness,
             damping=self.gripper_damping,

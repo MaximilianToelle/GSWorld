@@ -114,6 +114,7 @@ class Semantic3DGSWrapper(GaussianModel):
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
+        
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
         
         # Try to load semantics, create zeros if not available
@@ -126,6 +127,9 @@ class Semantic3DGSWrapper(GaussianModel):
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+
+        # === DEBUG ===
+        # self.visualize_pcd(xyz, features_dc)
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
@@ -261,3 +265,34 @@ class Semantic3DGSWrapper(GaussianModel):
             'rotation': self.get_rotation[mask],
             'indices': torch.where(mask)[0]
         }
+
+    @staticmethod
+    def visualize_pcd(xyz: np.ndarray, features_dc: np.ndarray):
+        """Visualize an (N, 3) point cloud colored by SH DC features in Open3D.
+
+        Args:
+            xyz: numpy array of shape (N, 3) with point positions.
+            features_dc: numpy array of shape (N, 3, 1) or (N, 3) with SH DC
+                coefficients (raw SH space, not yet converted to RGB).
+        """
+        import open3d as o3d
+
+        # SH 0th-order basis constant: C0 = 1 / (2 * sqrt(pi))
+        SH_C0 = 0.28209479177387814
+
+        # features_dc comes in as (N, 3, 1) from load_ply — squeeze to (N, 3)
+        sh = features_dc.squeeze()  # (N, 3)
+        rgb = np.clip(SH_C0 * sh + 0.5, 0.0, 1.0)  # SH → linear RGB, clamped for o3d
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz)
+        pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+        print(f"[DEBUG] Visualizing point cloud with {len(xyz)} points. Close the window to continue.")
+        o3d.visualization.draw_geometries(
+            [pcd],
+            window_name="GS Point Cloud Debug",
+            width=1280,
+            height=720,
+            point_show_normal=False,
+        )

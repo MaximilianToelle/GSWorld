@@ -35,7 +35,9 @@ class RealFr3(BaseEnv):
         # mind the conversion
         wrist2eef_sp = calib_mat2sapien_trans_mat(wrist2eef)
         wrist_p = wrist2eef_sp[:3, 3]
-        wrist_q = matrix_to_quaternion(common.to_tensor(wrist2eef_sp[:3, :3][None, ...]))
+        
+        wrist_R = wrist2eef_sp[:3, :3]
+        wrist_q = matrix_to_quaternion(common.to_tensor(wrist_R[None, ...]))
         wrist_pose = Pose.create_from_pq(p=wrist_p, q=wrist_q)
 
         right2base_sp = calib_mat2sapien_trans_mat(right2base)

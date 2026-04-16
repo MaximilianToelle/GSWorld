@@ -35,7 +35,6 @@ def parse_args(args=None):
     parser.add_argument("--obs_mode", default="rgb+segmentation", type=str, help="Observation mode")
     parser.add_argument("--sim_backend", default="auto", type=str, help="Which simulation backend to use. Can be 'auto', 'cpu', 'gpu'")
     parser.add_argument("--control_mode", default="pd_joint_pos", type=str, help="Control mode")
-    parser.add_argument("--render_mode", default="sensors", type=str, help="Render mode")
     parser.add_argument("--pause", default=False, action="store_true", help="If using human render mode, auto pauses the simulation upon loading")
     parser.add_argument("--quiet_ms", default=False, action="store_true", help="Disable verbose output.")
     parser.add_argument("--seed", default=0, type=int, nargs="+", help="Seed(s) for random actions and simulator. Can be a single integer or a list of integers. Default is None (no seeds)")
