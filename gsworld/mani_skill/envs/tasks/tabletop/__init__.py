@@ -8,3 +8,4 @@ from .franka.align import AlignFr3Env
 from .franka.pnp_box import PnpBoxFr3Env
 from .franka.pour_mustard import PourMustardFr3Env
 from .franka.stack import StackFr3Env
+from .franka.stack_wrist_cam import StackFr3WristCamEnv

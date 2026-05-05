@@ -9,7 +9,7 @@ import numpy as np
 from tqdm import tqdm
 import os.path as osp
 from mani_skill.utils.wrappers.record import RecordEpisode
-from gsworld.mani_skill.utils.wrappers import GSWorldWrapper
+from gsworld.mani_skill.utils.wrappers import GSWorldWrapper, WristCamGSWorldWrapper
 from mani_skill.trajectory.merge_trajectory import merge_trajectories
 from gsworld.mani_skill.examples.motionplanning.franka.solutions import *
 from gsworld.constants import *
@@ -21,6 +21,7 @@ MP_SOLUTIONS = {
     "PourMustardFr3Env-v1": solvePourMustardFr3,
     "AlignFr3Env-v1": solveAlignFr3,
     "StackFr3Env-v1": solveStackFr3,
+    "StackFr3WristCamEnv-v1": solveStackFr3,
 }
 
 def parse_args(args=None):
@@ -30,6 +31,9 @@ def parse_args(args=None):
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+
+    # gaussian splatting 
+    parser.add_argument("--online_gaussian_splatting", default=False, type=bool)
 
     # maniskill
     parser.add_argument("--obs_mode", default="rgb+segmentation", type=str, help="Observation mode")
@@ -47,7 +51,9 @@ def parse_args(args=None):
     parser.add_argument("--only-count-success", action="store_true", help="If true, generates trajectories until num_traj of them are successful and only saves the successful trajectories/videos")
     parser.add_argument("-b", "--sim-backend", type=str, default="auto", help="Which simulation backend to use. Can be 'auto', 'cpu', 'gpu'")
     parser.add_argument("--render-mode", type=str, default="rgb_array", help="can be 'sensors' or 'rgb_array' which only affect what is saved to videos")
-    parser.add_argument("--vis", action="store_true", help="whether or not to open a GUI to visualize the solution live")
+    parser.add_argument("--vis_sapien", action="store_true", help="whether or not to open a GUI to visualize the solution live")
+    parser.add_argument("--vis_gsplats", action="store_true", help="whether or not to open a GUI to visualize the solution live")
+    parser.add_argument("--debug_mp", action="store_true", help="whether or not to be in debug mode throughout motion planning")
     parser.add_argument("--save-video", action="store_true", help="whether or not to save videos locally")
     parser.add_argument("--traj-name", type=str, help="The name of the trajectory .h5 file that will be created.")
     parser.add_argument("--shader", default="default", type=str, help="Change shader used for rendering. Default is 'default' which is very fast. Can also be 'rt' for ray tracing and generating photo-realistic renders. Can also be 'rt-fast' for a faster but lower quality ray-traced renderer")
@@ -98,12 +104,21 @@ def _main(args, pipeline, proc_id: int = 0, start_seed: int = 0) -> str:
     if args.num_procs > 1:
         new_traj_name = new_traj_name + "." + str(proc_id)
 
-    env = GSWorldWrapper(
-        env=env,
-        scene_gs_cfg_name=args.scene_cfg_name,
-        robot_pipe=pipeline.extract(args), # TODO this is needed for render
-        device="cuda",
-    )
+    if args.online_gaussian_splatting: 
+        env = WristCamGSWorldWrapper(
+            env=env,
+            scene_gs_cfg_name=args.scene_cfg_name,
+            robot_pipe=pipeline.extract(args), # TODO this is needed for render
+            use_gsplat_viewer=args.vis_gsplats,
+            device="cuda",
+        )
+    else:
+        env = GSWorldWrapper(
+            env=env,
+            scene_gs_cfg_name=args.scene_cfg_name,
+            robot_pipe=pipeline.extract(args), # TODO this is needed for render
+            device="cuda",
+        )
 
     env = RecordEpisode(
         env,
@@ -131,7 +146,7 @@ def _main(args, pipeline, proc_id: int = 0, start_seed: int = 0) -> str:
     failed_motion_plans = 0
     passed = 0
     while True: # main demo collection loop
-        res = solve(env, seed=seed, debug=False, vis=True if args.vis else False)
+        res = solve(env, seed=seed, debug=True if args.debug_mp else False, vis=True if args.vis_sapien else False)
         if res == -1:
             success = False
             failed_motion_plans += 1
