@@ -410,13 +410,13 @@ fr3_gs_semantics = {
     "fr3_link6": 7,
     "fr3_link7": 8,
     "fr3_link8": 9,
-    "fr3_hand": [10, 14, 15],
+    "fr3_hand": 10, # [10, 14, 15],
     "fr3_hand_tcp": 11,
     "fr3_leftfinger": 12,
     "fr3_rightfinger": 13,
-    # "fr3_cam_mount": 16,
-    #"camera_base_link": 14,
-    #"camera_link": 15,
+    "fr3_cam_mount": 16,
+    "camera_base_link": 14,
+    "camera_link": 15,
 }
 
 obj_gs_semantics = {

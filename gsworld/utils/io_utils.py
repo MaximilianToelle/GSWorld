@@ -50,6 +50,8 @@ def save_images_to_mp4(hdf5_path, output_dir, save_frame=False, fps=30):
     with h5py.File(hdf5_path, 'r') as f:
         for traj in sorted(f.keys(), key=lambda x: int(x.split('_')[-1])):
             for key in f[traj]['obs']['sensor_data'].keys():
+                if key == 'gsplats':
+                    continue
                 images = f[traj]['obs']['sensor_data'][key]['rgb'][:]  # (N, H, W, C)
 
                 if images.ndim == 4 and images.shape[-1] in [1, 3, 4]:  # (N, H, W, C)

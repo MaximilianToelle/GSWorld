@@ -2,6 +2,7 @@ import copy
 from typing import Union
 import gymnasium as gym
 import torch
+import numpy as np
 import os
 import time
 import matplotlib.pyplot as plt
@@ -18,7 +19,21 @@ from arguments import PipelineParams
 
 from gsworld.utils.pcd_utils import extract_rigid_transform
 from gsworld.utils.gs_utils import transform_gaussians
-from gsworld.constants import *
+from gsworld.constants import (
+    xarm_gs_semantics,
+    sim2gs_xarm_trans,
+    fr3_gs_semantics,
+    sim2gs_arm_trans,
+    r1_gs_semantics,
+    sim2gs_r1_trans,
+    obj_gs_semantics,
+    robot_scan_qpos,
+    object_offset,
+    CFG_DIR,
+    sim2gs_object_transforms,
+    object_scale,
+)
+
 from gsworld.utils.gaussian_merger import GaussianModelMerger
 
 import viser
@@ -34,10 +49,14 @@ except:
     SPARSE_ADAM_AVAILABLE = False
 
 
-class GSWorldWrapper(gym.Wrapper):
-    """This wrapper wraps any maniskill env created via gym.make to add gaussian splattings.
-    Also, this wrapper returns the gaussian observation. Code is adapted from original gymnasium wrapper.
+class WristCamGSWorldWrapper(gym.Wrapper):
+    """This wrapper wraps any maniskill env created via gym.make to add *online* gaussian splatting.
+    Online means that it will only add Gaussians from the prescanned assets to the agent's observation if they have been seen by the wrist camera. 
+    Seen means that they are in the view frustum of the camera and their depth value is smaller or equal to the ground-truth depth + small epsilon
+    For data recording, we store all Gaussians to have fixed sized tensors but add an already_seen_mask to distinguish seen from unseen Gaussians.
     """
+
+    SH_C0 = 0.28209479177387814
 
     def __init__(
         self,
@@ -51,6 +70,9 @@ class GSWorldWrapper(gym.Wrapper):
         use_gsplat_viewer: bool = False,
     ):
         super().__init__(env)
+
+        self.target_cam_name = "wrist_cam"
+
         self.num_envs = env.num_envs
         self.robot_pipe = robot_pipe
         self.device = device
@@ -70,6 +92,16 @@ class GSWorldWrapper(gym.Wrapper):
         else:
             raise NotImplementedError
         self.sim2gs_arm_trans = torch.tensor(self.sim2gs_arm_trans, dtype=torch.float32, device=self.device)
+        self.gs_arm_trans2sim = torch.linalg.inv(self.sim2gs_arm_trans)
+
+        self.gs_arm2sim_R_unnorm = self.gs_arm_trans2sim[:3, :3]
+        self.gs_arm2sim_t = self.gs_arm_trans2sim[:3, 3]
+
+        gs_arm2sim_scales = torch.linalg.norm(self.gs_arm2sim_R_unnorm, dim=0)
+        assert torch.allclose(gs_arm2sim_scales, gs_arm2sim_scales[0], atol=1e-5), f"Assumed uniform scale, but axis gs_arm2sim_scales differ: {gs_arm2sim_scales}"
+        self.scale_gs_arm2sim = gs_arm2sim_scales[0]
+        self.R_gs_arm2sim = self.gs_arm2sim_R_unnorm / self.scale_gs_arm2sim
+
         self.obj_gs_semantics = obj_gs_semantics
         ###########################################################
         
@@ -83,11 +115,22 @@ class GSWorldWrapper(gym.Wrapper):
         ###########################################################################
         merger = GaussianModelMerger()
         path = os.path.join(CFG_DIR, f"{scene_gs_cfg_name}.json")
-        indices = merger.load_models_from_config(path)
-        merged_model = merger.merge_models()
-        self.initial_merger_robot = merged_model
+        merger.load_models_from_config(path)
+        merged_model = merger.merge_models()        # merging all models loaded from config
+        self.merged_init_gaussian_models = merged_model
+
+        # we only care about high opacity Gaussians
+        high_opacity_mask = (torch.sigmoid(self.merged_init_gaussian_models._opacity) > 0.90).squeeze()  # opacities are stored as logits
+        self.merged_init_gaussian_models._xyz = self.merged_init_gaussian_models._xyz[high_opacity_mask]
+        self.merged_init_gaussian_models._features_dc = self.merged_init_gaussian_models._features_dc[high_opacity_mask]
+        self.merged_init_gaussian_models._features_rest = self.merged_init_gaussian_models._features_rest[high_opacity_mask]
+        self.merged_init_gaussian_models._opacity = self.merged_init_gaussian_models._opacity[high_opacity_mask]
+        self.merged_init_gaussian_models._scaling = self.merged_init_gaussian_models._scaling[high_opacity_mask]
+        self.merged_init_gaussian_models._rotation = self.merged_init_gaussian_models._rotation[high_opacity_mask]
+        self.merged_init_gaussian_models._semantics = self.merged_init_gaussian_models._semantics[high_opacity_mask]
         ###########################################################################
 
+        # storing initial pose matrices of the robot links in the Gaussian splatting scan pose 
         env4moving = gym.make(
             "Empty-v1",
             obs_mode="none",
@@ -105,8 +148,8 @@ class GSWorldWrapper(gym.Wrapper):
             # NOTE: The wrist camera pose is different but we do not care as we do not see it
             robot_name_for_gs = "fr3_umi_wrist435"
 
-        self.gs_initial_qpos = robot_scan_qpos[robot_name_for_gs]
-        self.env4moving.agent.robot.set_qpos(self.gs_initial_qpos)
+        gs_initial_qpos = robot_scan_qpos[robot_name_for_gs]
+        self.env4moving.agent.robot.set_qpos(gs_initial_qpos)
         self.gs_link_pose_mats = []
         for link in self.env4moving.agent.robot.get_links():
             link_mat = link.pose.to_transformation_matrix().to(self.device)
@@ -115,10 +158,8 @@ class GSWorldWrapper(gym.Wrapper):
         print("finished storing initial qpos and link pose mats")
         # ######################
 
-        self.gs_movable_pts = dict()
-
         # Precompute semantic masks once — these never change
-        semantics = self.initial_merger_robot._semantics.long().squeeze(-1)
+        semantics = self.merged_init_gaussian_models._semantics.long().squeeze(-1)
         self._semantic_masks = {}   # key -> bool mask (N,)
         self._semantic_indices = {} # key -> index tensor for transform_gaussians
         for link in self.env.unwrapped.agent.robot.get_links():
@@ -131,6 +172,16 @@ class GSWorldWrapper(gym.Wrapper):
             mask = (semantics == sem_id)
             self._semantic_masks[actor_key] = mask
             self._semantic_indices[actor_key] = torch.where(mask)[0]
+
+        # NOTE: we only insert active moving Gaussians into the observation later
+        self.moving_gaussians = dict()
+        stacked_semantic_masks = torch.stack(list(self._semantic_masks.values()))
+        self.num_moving_gaussians = torch.any(stacked_semantic_masks, dim=0).sum()
+        self.active_gaussians_mask = torch.zeros(
+            (self.num_envs, self.num_moving_gaussians), 
+            dtype=torch.bool, 
+            device=self.device
+        )
 
         # Build Sapien segmentation ID → GS semantic ID lookup table
         max_sapien_id = max(self.base_env.segmentation_id_map.keys()) + 1
@@ -145,38 +196,12 @@ class GSWorldWrapper(gym.Wrapper):
             elif name in self.obj_gs_semantics:
                 self._sapien_id_to_gs_id[sapien_id] = self.obj_gs_semantics[name]
 
-        # Init Gsplat Viewer
+        # NOTE: GSplat Viewer gets initialized during reset as there is nothing to see before 
         self.use_gsplat_viewer = use_gsplat_viewer
         if self.use_gsplat_viewer:
-            self.gs4viewer = {
-                "means": self.initial_merger_robot._xyz.view(-1, 3),
-                "quats": self.initial_merger_robot._rotation.view(-1, 4),
-                "scales": self.initial_merger_robot._scaling.view(-1, 3),
-                "rgb_colors": self.initial_merger_robot._features_dc.view(-1, 3),
-                "opacities": self.initial_merger_robot._opacity.view(-1),
-            }
-            server = viser.ViserServer(port=8081, verbose=False)
-            self.viewer = GsplatViewer(
-                        server=server,
-                        render_fn=lambda camera_state, render_tab_state: _viewer_render_fn(
-                            camera_state, 
-                            render_tab_state, 
-                            self.gs4viewer, 
-                            "3dgs", 
-                            device
-                        ),
-                        output_dir=None,
-                        mode="training",
-                    )
-            scene_center = (self.gs4viewer["means"].data
-                    .mean(dim=0)
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .tolist()
-                )
-            time.sleep(1)
-            server.on_client_connect(partial(_on_connect, server=server, scene_center=scene_center))
+            self.gs4viewer = {}
+            self.server = viser.ViserServer(port=8081, verbose=False)
+            self.server.on_client_connect(partial(_on_connect, server=self.server))
 
     def transform_gs_perlink(self, splats, gs_init_qpos=None, target_mat=None, eef_pos=None):
         """Transform gaussian splatting model based on robot joint states"""
@@ -189,7 +214,7 @@ class GSWorldWrapper(gym.Wrapper):
                 for i in range(3):
                     link_mat[:, i, 3] += object_offset["xarm_arm"][i]
             link_trans = self.sim2gs_arm_trans @ link_mat @ torch.linalg.inv(self.gs_link_pose_mats[idx]) @ torch.linalg.inv(self.sim2gs_arm_trans)
-            link_xyz, link_scaling, link_rotation, link_opacity = transform_gaussians(
+            link_positions, link_log_scales, link_quats, link_logit_opacities = transform_gaussians(
                 transformed_splats,
                 selected_indices=self._semantic_indices[link.name],
                 scale=None,
@@ -197,8 +222,8 @@ class GSWorldWrapper(gym.Wrapper):
                 translation=link_trans[:, :3, 3],
                 new_opacity=None,
                 )
-            self.gs_movable_pts[link.name] = (link_xyz, link_scaling, link_rotation, link_opacity)
-
+            link_features_dc = transformed_splats._features_dc[self._semantic_indices[link.name]]
+            self.moving_gaussians[link.name] = (link_positions, link_log_scales, link_quats, link_logit_opacities, link_features_dc)
         #######################
 
         if "actors" in self.env.base_env.get_state_dict():
@@ -218,7 +243,7 @@ class GSWorldWrapper(gym.Wrapper):
                 # Extract and apply rigid transform
                 transform, scale, _, _ = extract_rigid_transform(full_transform)
 
-                obj_xyz, obj_scaling, obj_rotation, obj_opacity = transform_gaussians(
+                obj_positions, obj_log_scales, obj_quats, obj_logit_opacities = transform_gaussians(
                     transformed_splats,
                     selected_indices=self._semantic_indices[actor_key],
                     scale=scale * object_scale[actor_key],
@@ -226,7 +251,8 @@ class GSWorldWrapper(gym.Wrapper):
                     translation=transform[:, :3, 3],
                     new_opacity=None,
                 )
-                self.gs_movable_pts[actor_key] = (obj_xyz, obj_scaling, obj_rotation, obj_opacity)
+                obj_features_dc = transformed_splats._features_dc[self._semantic_indices[actor_key]]
+                self.moving_gaussians[actor_key] = (obj_positions, obj_log_scales, obj_quats, obj_logit_opacities, obj_features_dc)
                 self.gs_semantics[actor_key] = self.obj_gs_semantics[actor_key]
 
     @property
@@ -240,6 +266,126 @@ class GSWorldWrapper(gym.Wrapper):
             elif isinstance(obj, Link):
                 print(f"{obj_id}: Link, name - {obj.name}")
 
+    def _update_active_gaussians(self, gsplat_positions, extrinsic_cv, intrinsic_cv, depth, epsilon: float = 0.01):
+        """
+        A moving Gaussian is active as soon as it has been seen by the wrist camera. 
+        Computes View Frustum + Occlusion on the current wrist camera view against the ground-truth SAPIEN depth map
+        Updates self.active_gaussians_mask
+
+        Params:
+            extrinsic_cv: (B, 4, 4)
+            intrinsic_cv: (B, 3, 3)
+            depth: (B, H, W)
+        """
+
+        B, N = self.active_gaussians_mask.shape
+        
+        # Transform GS World -> SAPIEN World
+        # sim2gs_arm_trans maps Sapien -> GS. We invert to go GS -> Sapien.
+        gs_arm2sim = torch.linalg.inv(self.sim2gs_arm_trans) # (4, 4)
+        ones = torch.ones((B, N, 1), device=self.device, dtype=gsplat_positions.dtype)
+        xyz_gs_homo = torch.cat([gsplat_positions, ones], dim=-1) # (B, N, 4)
+        
+        # Batched multiplication (B, N, 4) @ (4, 4)
+        xyz_sapien_homo = torch.matmul(xyz_gs_homo, gs_arm2sim.T) 
+        
+        # Transform SAPIEN World -> OpenCV Camera Frame
+        extrinsic_cv_hom = torch.eye(4, device=self.device)
+        extrinsic_cv_hom[:3, :4] = extrinsic_cv
+        xyz_cam_homo = torch.bmm(xyz_sapien_homo, extrinsic_cv_hom.unsqueeze(0).transpose(1, 2)) # (B, N, 4)
+        
+        # Homogenous coordinates to cartesian coordinates 
+        xyz_cam = xyz_cam_homo[..., :3] / xyz_cam_homo[..., 3:] 
+        X, Y, Z = xyz_cam[..., 0], xyz_cam[..., 1], xyz_cam[..., 2]
+
+        # Frustum Culling (Pinhole Projection)
+        fx = intrinsic_cv[:, 0, 0].unsqueeze(1) # (B, 1)
+        fy = intrinsic_cv[:, 1, 1].unsqueeze(1)
+        cx = intrinsic_cv[:, 0, 2].unsqueeze(1)
+        cy = intrinsic_cv[:, 1, 2].unsqueeze(1)
+
+        # Must be in front of the camera
+        z_mask = Z > 0.01 
+        
+        u = (fx * X / Z) + cx
+        v = (fy * Y / Z) + cy
+        
+        H, W = depth.shape[1], depth.shape[2]
+        
+        u_idx = torch.round(u).long()
+        v_idx = torch.round(v).long()
+        
+        view_frustum_mask = (u_idx >= 0) & (u_idx < W) & (v_idx >= 0) & (v_idx < H)
+        in_view_mask = z_mask & view_frustum_mask # (B, N)
+
+        # Occlusion Culling (Z-Buffer Check)
+        # Convert SAPIEN depth to meters if it is stored as uint16 mm
+        if depth.dtype in [torch.uint16, torch.int16]:
+            sapien_depth = depth.float() / 1000.0
+        else:
+            sapien_depth = depth
+
+        # Clamp indices to prevent out-of-bounds errors for points outside the frustum
+        # NOTE: Out-of-view gets valid depth values but is masked out through in_view_mask
+        u_idx_clamped = torch.clamp(u_idx, 0, W - 1)
+        v_idx_clamped = torch.clamp(v_idx, 0, H - 1)
+        
+        # Batched indexing to extract depth at each projected pixel
+        batch_indices = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
+        point_depth_in_img = sapien_depth[batch_indices, v_idx_clamped, u_idx_clamped] # (B, N)
+
+        # A point is visible if its Z distance is less than or equal to the recorded SAPIEN depth + volume margin.
+        # We also treat depth == 0 as infinite distance (background sky).
+        feasible_depth = (point_depth_in_img > 0) & torch.isfinite(point_depth_in_img)
+        visible_mask = (Z <= (point_depth_in_img + epsilon)) & feasible_depth
+        
+        # Final visibility for this specific timestep
+        currently_visible_mask = in_view_mask & visible_mask # (B, N)
+        
+        # Update global permanence (/ spatial memory) mask
+        self.active_gaussians_mask = self.active_gaussians_mask | currently_visible_mask
+
+    def _postprocess_gaussians(self, gsplats, active_gaussians_mask):
+        """
+            Postprocesses and concatenates gaussian parameter groups + active_gaussians_mask for downstream policy 
+            NOTE: We do not filter out non-active Gaussians directly as it leads to variable size tensors
+        """
+
+        quats = torch.nn.functional.normalize(gsplats["quats"], dim=-1)
+        rot_matrices = quaternion_to_matrix(quats)
+        rotations_9d = rot_matrices.reshape(*quats.shape[:-1], 9)
+        
+        opacities = torch.sigmoid(gsplats["logit_opacities"]).unsqueeze(-1)
+        
+        rgbs = gsplats["features_dc"] * self.SH_C0 + 0.5
+        rgbs = torch.clamp(rgbs, 0.0, 1.0)
+        
+        # === Tranform from GS to SAPIEN reference frame (matching gs_maniskill_wrapper.py) ===
+        # NOTE: All Gaussians are in the GS arm space due to the gs_transform!
+        # 1. Transform XYZ positions
+        positions = gsplats["positions"] @ self.gs_arm2sim_R_unnorm.T + self.gs_arm2sim_t
+
+        # 2. Transform Rotation Matrices 
+        rot_mats_sim = self.R_gs_arm2sim.unsqueeze(0).unsqueeze(0) @ rot_matrices
+        rotations_9d = rot_mats_sim.reshape(*quats.shape[:-1], 9)
+
+        # 3. Transform lengths (scaling parameters)
+        log_scales = gsplats["log_scales"] + torch.log(self.scale_gs_arm2sim)
+
+        # concatenate all params into one big tensor
+        processed_gsplats = torch.concatenate([
+            positions, 
+            rotations_9d, 
+            log_scales, 
+            opacities, 
+            rgbs,
+            active_gaussians_mask.unsqueeze(-1),
+            ]
+            , axis=-1
+        )
+
+        return processed_gsplats
+
     def step(self, action):
         if self.use_gsplat_viewer:
             while self.viewer.state == "paused":
@@ -248,8 +394,18 @@ class GSWorldWrapper(gym.Wrapper):
             tic = time.time()
 
         obs, reward, terminated, truncated, info = self.env.step(action)
-        self.transform_gs_perlink(self.initial_merger_robot)
-        #######################################################################
+        
+        # Move Gaussians, update spatial memory mask, postprocess Gaussians and add to observation
+        self.transform_gs_perlink(self.merged_init_gaussian_models)
+        gsplats = gather_per_obj_gaussians_by_param_groups(self.moving_gaussians, self.num_envs)
+        extrinsic_cv = obs["sensor_param"][self.target_cam_name]["extrinsic_cv"].to(self.device)
+        intrinsic_cv = obs["sensor_param"][self.target_cam_name]["intrinsic_cv"].to(self.device)
+        depth = obs['sensor_data'][self.target_cam_name]['depth'].squeeze(-1).to(self.device)
+        self._update_active_gaussians(gsplats["positions"], extrinsic_cv, intrinsic_cv, depth, epsilon=0.01)
+        processed_gsplats = self._postprocess_gaussians(gsplats, self.active_gaussians_mask)
+        
+        obs['sensor_data']['gsplats'] = processed_gsplats
+        ############################################################
         
         gs_renders = self._render_gsworld()
         # overwriting the env observation with obtained gs renders
@@ -275,12 +431,15 @@ class GSWorldWrapper(gym.Wrapper):
 
         # Update gaussians for gsplatviewer 
         if self.use_gsplat_viewer:
-            for key in self.gs_movable_pts:
-                mask = self._semantic_masks[key]
-                self.gs4viewer["means"][mask] = self.gs_movable_pts[key][0].view(-1, 3)
-                self.gs4viewer["scales"][mask] = self.gs_movable_pts[key][1].view(-1, 3)
-                self.gs4viewer["quats"][mask] = self.gs_movable_pts[key][2].view(-1, 4)
-                self.gs4viewer["opacities"][mask] = self.gs_movable_pts[key][3].view(-1)
+            self.gs4viewer["means"] = gsplats["positions"][self.active_gaussians_mask] 
+            self.gs4viewer["scales"] = gsplats["log_scales"][self.active_gaussians_mask] 
+            self.gs4viewer["quats"] = gsplats["quats"][self.active_gaussians_mask] 
+            self.gs4viewer["opacities"] = gsplats["logit_opacities"][self.active_gaussians_mask] 
+            features_dc = gsplats["features_dc"][self.active_gaussians_mask] 
+            
+            rgb = features_dc * self.SH_C0 + 0.5
+            rgb = torch.clamp(rgb, 0.0, 1.0)
+            self.gs4viewer["rgb_colors"] = rgb
 
             self.viewer.rerender(None)
             self.viewer.lock.release()
@@ -295,8 +454,20 @@ class GSWorldWrapper(gym.Wrapper):
     def reset(self, *, seed=None, options=None):
         obs, info = self.env.reset(seed=seed, options=options)
 
-        self.transform_gs_perlink(self.initial_merger_robot)
-        ##############################################
+        # Clear spatial memory at the start of an episode!
+        self.active_gaussians_mask.zero_()
+
+        # Move Gaussians, update spatial memory mask, postprocess Gaussians and add to observation
+        self.transform_gs_perlink(self.merged_init_gaussian_models)
+        gsplats = gather_per_obj_gaussians_by_param_groups(self.moving_gaussians, self.num_envs)
+        extrinsic_cv = obs["sensor_param"][self.target_cam_name]["extrinsic_cv"].to(self.device)
+        intrinsic_cv = obs["sensor_param"][self.target_cam_name]["intrinsic_cv"].to(self.device)
+        depth = obs['sensor_data'][self.target_cam_name]['depth'].squeeze(-1).to(self.device)
+        self._update_active_gaussians(gsplats["positions"], extrinsic_cv, intrinsic_cv, depth, epsilon=0.01)
+        processed_gsplats = self._postprocess_gaussians(gsplats, self.active_gaussians_mask)
+        
+        obs['sensor_data']['gsplats'] = processed_gsplats
+        ############################################################
         
         gs_renders = self._render_gsworld()
         # overwriting the env observation with obtained gs renders
@@ -308,6 +479,31 @@ class GSWorldWrapper(gym.Wrapper):
             
             obs["sensor_param"][cam_name]["gl_cam2sapien_world"] = self.env.unwrapped.scene.sensors[cam_name].camera.get_model_matrix()
 
+        # Init Gsplat Viewer
+        if self.use_gsplat_viewer:
+            self.gs4viewer["means"] = gsplats["positions"][self.active_gaussians_mask] 
+            self.gs4viewer["scales"] = gsplats["log_scales"][self.active_gaussians_mask] 
+            self.gs4viewer["quats"] = gsplats["quats"][self.active_gaussians_mask] 
+            self.gs4viewer["opacities"] = gsplats["logit_opacities"][self.active_gaussians_mask] 
+            features_dc = gsplats["features_dc"][self.active_gaussians_mask] 
+            
+            rgb = features_dc * self.SH_C0 + 0.5
+            rgb = torch.clamp(rgb, 0.0, 1.0)
+            self.gs4viewer["rgb_colors"] = rgb
+
+            self.viewer = GsplatViewer(
+                server=self.server,
+                render_fn=lambda camera_state, render_tab_state: _viewer_render_fn(
+                    camera_state, 
+                    render_tab_state, 
+                    self.gs4viewer, 
+                    "3dgs", 
+                    self.device
+                ),
+                output_dir=None,
+                mode="training",
+            )
+            
         return obs, info
 
     def render(self):
@@ -360,17 +556,17 @@ class GSWorldWrapper(gym.Wrapper):
                 cam_name_depth = []
                 for i in range(self.num_envs):
                     # prepare gaussian model
-                    gs4render = copy.deepcopy(self.initial_merger_robot)
-                    for key in self.gs_movable_pts:
+                    gs4render = copy.deepcopy(self.merged_init_gaussian_models)
+                    for key in self.moving_gaussians:
                         mask = self._semantic_masks[key]
-                        if self.gs_movable_pts[key][0].shape[0] == self.num_envs:
-                            gs4render._xyz[mask] = self.gs_movable_pts[key][0][i]
-                        if self.gs_movable_pts[key][1].shape[0] == self.num_envs:
-                            gs4render._scaling[mask] = self.gs_movable_pts[key][1][i]
-                        if self.gs_movable_pts[key][2].shape[0] == self.num_envs:
-                            gs4render._rotation[mask] = self.gs_movable_pts[key][2][i]
-                        if self.gs_movable_pts[key][3].shape[0] == self.num_envs:
-                            gs4render._opacity[mask] = self.gs_movable_pts[key][3][i]
+                        if self.moving_gaussians[key][0].shape[0] == self.num_envs:
+                            gs4render._xyz[mask] = self.moving_gaussians[key][0][i]
+                        if self.moving_gaussians[key][1].shape[0] == self.num_envs:
+                            gs4render._scaling[mask] = self.moving_gaussians[key][1][i]
+                        if self.moving_gaussians[key][2].shape[0] == self.num_envs:
+                            gs4render._rotation[mask] = self.moving_gaussians[key][2][i]
+                        if self.moving_gaussians[key][3].shape[0] == self.num_envs:
+                            gs4render._opacity[mask] = self.moving_gaussians[key][3][i]
                     output = render(cam_param, gs4render, self.robot_pipe, background, 
                                     use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
                     rendering = output["render"].detach()
@@ -443,6 +639,52 @@ class GSWorldWrapper(gym.Wrapper):
             cam_params.update({cam_name: cam_param})
 
         return cam_params
+
+
+def gather_per_obj_gaussians_by_param_groups(gaussians, num_envs):
+    B = num_envs
+    
+    valid_entries = [v for v in gaussians.values() if v[0].numel() > 0]
+    all_positions, all_log_scales, all_quats, all_logit_opacities, all_features_dc = zip(*valid_entries)
+    
+    gsplats = {
+        "positions": torch.cat([x.reshape(B, -1, 3) for x in all_positions], dim=1),
+        "log_scales": torch.cat([s.reshape(B, -1, 3) for s in all_log_scales], dim=1),
+        "quats": torch.cat([q.reshape(B, -1, 4) for q in all_quats], dim=1),
+        "logit_opacities": torch.cat([o.reshape(B, -1) for o in all_logit_opacities], dim=1),
+        "features_dc": torch.cat([c.reshape(B, -1, 3) for c in all_features_dc], dim=1),
+    }
+
+    return gsplats
+
+
+def quaternion_to_matrix(quaternions: torch.Tensor) -> torch.Tensor:
+    """
+    Convert rotations given as quaternions to rotation matrices.
+    Args:
+        quaternions: quaternions with real part first,
+            as tensor of shape (..., 4).
+    Returns:
+        Rotation matrices as tensor of shape (..., 3, 3).
+    """
+    r, i, j, k = torch.unbind(quaternions, -1)
+    two_s = 2.0 / (quaternions * quaternions).sum(-1)
+
+    o = torch.stack(
+        (
+            1 - two_s * (j * j + k * k),
+            two_s * (i * j - k * r),
+            two_s * (i * k + j * r),
+            two_s * (i * j + k * r),
+            1 - two_s * (i * i + k * k),
+            two_s * (j * k - i * r),
+            two_s * (i * k - j * r),
+            two_s * (j * k + i * r),
+            1 - two_s * (i * i + j * j),
+        ),
+        -1,
+    )
+    return o.reshape(quaternions.shape[:-1] + (3, 3))
 
 
 def _debug_depth_to_sapien_world_pcd(depth, intrinsic, gl_cam2sapien_world):
