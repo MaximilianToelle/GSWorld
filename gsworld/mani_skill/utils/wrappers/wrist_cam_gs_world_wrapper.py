@@ -120,14 +120,14 @@ class WristCamGSWorldWrapper(gym.Wrapper):
         self.merged_init_gaussian_models = merged_model
 
         # we only care about high opacity Gaussians
-        high_opacity_mask = (torch.sigmoid(self.merged_init_gaussian_models._opacity) > 0.90).squeeze()  # opacities are stored as logits
-        self.merged_init_gaussian_models._xyz = self.merged_init_gaussian_models._xyz[high_opacity_mask]
-        self.merged_init_gaussian_models._features_dc = self.merged_init_gaussian_models._features_dc[high_opacity_mask]
-        self.merged_init_gaussian_models._features_rest = self.merged_init_gaussian_models._features_rest[high_opacity_mask]
-        self.merged_init_gaussian_models._opacity = self.merged_init_gaussian_models._opacity[high_opacity_mask]
-        self.merged_init_gaussian_models._scaling = self.merged_init_gaussian_models._scaling[high_opacity_mask]
-        self.merged_init_gaussian_models._rotation = self.merged_init_gaussian_models._rotation[high_opacity_mask]
-        self.merged_init_gaussian_models._semantics = self.merged_init_gaussian_models._semantics[high_opacity_mask]
+        # high_opacity_mask = (torch.sigmoid(self.merged_init_gaussian_models._opacity) > 0.90).squeeze()  # opacities are stored as logits
+        # self.merged_init_gaussian_models._xyz = self.merged_init_gaussian_models._xyz[high_opacity_mask]
+        # self.merged_init_gaussian_models._features_dc = self.merged_init_gaussian_models._features_dc[high_opacity_mask]
+        # self.merged_init_gaussian_models._features_rest = self.merged_init_gaussian_models._features_rest[high_opacity_mask]
+        # self.merged_init_gaussian_models._opacity = self.merged_init_gaussian_models._opacity[high_opacity_mask]
+        # self.merged_init_gaussian_models._scaling = self.merged_init_gaussian_models._scaling[high_opacity_mask]
+        # self.merged_init_gaussian_models._rotation = self.merged_init_gaussian_models._rotation[high_opacity_mask]
+        # self.merged_init_gaussian_models._semantics = self.merged_init_gaussian_models._semantics[high_opacity_mask]
         ###########################################################################
 
         # storing initial pose matrices of the robot links in the Gaussian splatting scan pose 
@@ -413,6 +413,11 @@ class WristCamGSWorldWrapper(gym.Wrapper):
             obs['sensor_data'][cam_name]['rgb'] = gs_render['rgb']
             # Remap Sapien segmentation IDs to GS semantic IDs (pixel-perfect, no blending artifacts from GS)
             sapien_seg = obs['sensor_data'][cam_name]['segmentation'].long()
+            if sapien_seg.max() >= self._sapien_id_to_gs_id.size(0):
+                # If we try to render the sapien simulation, a new actor with the target grasping pose from the motion planner gets added! 
+                new_map = torch.full((sapien_seg.max().item() + 1,), -1, dtype=torch.int16, device=self.device)
+                new_map[:self._sapien_id_to_gs_id.size(0)] = self._sapien_id_to_gs_id
+                self._sapien_id_to_gs_id = new_map
             obs['sensor_data'][cam_name]['segmentation'] = self._sapien_id_to_gs_id[sapien_seg]
             # NOTE: taking perfect depth from sapien instead of worse gs_render depth (assumption: good alignment of gs on sapien objects)
             
