@@ -21,7 +21,7 @@ MP_SOLUTIONS = {
     "PourMustardFr3Env-v1": solvePourMustardFr3,
     "AlignFr3Env-v1": solveAlignFr3,
     "StackFr3Env-v1": solveStackFr3,
-    "StackFr3WristCamEnv-v1": solveStackFr3,
+    "StackFr3WristCamEnv-v1": solveStackWristCamFr3,
 }
 
 def parse_args(args=None):
@@ -33,7 +33,7 @@ def parse_args(args=None):
     parser.add_argument("--quiet", action="store_true")
 
     # gaussian splatting 
-    parser.add_argument("--online_gaussian_splatting", default=False, type=bool)
+    parser.add_argument("--online_gaussian_splatting", action="store_true")
 
     # maniskill
     parser.add_argument("--obs_mode", default="rgb+segmentation", type=str, help="Observation mode")

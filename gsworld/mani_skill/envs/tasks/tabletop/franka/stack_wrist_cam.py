@@ -22,7 +22,7 @@ WARNED_ONCE = False
 
 FR3_HIGH_INIT_QPOS = np.array([0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.8, 0.04, 0.04])
 
-@register_env("StackFr3WristCamEnv-v1", max_episode_steps=200, asset_download_ids=["ycb"])
+@register_env("StackFr3WristCamEnv-v1", max_episode_steps=250, asset_download_ids=["ycb"])
 class StackFr3WristCamEnv(RealFr3WristCam):
     # NOTE: fr3_umi_wrist435_modified does not match with the position of the prescanned, real-world franka robot wrist camera! 
     # But we also do not care about it as we only use the camera view from the wrist camera and not a third-person view rendering the wrist camera
@@ -63,7 +63,6 @@ class StackFr3WristCamEnv(RealFr3WristCam):
         )
         self.table_scene.build()
 
-        model_ids = ["005_tomato_soup_can"]
         if (
             self.num_envs > 1
             and self.num_envs < len(self.all_model_ids)
@@ -77,7 +76,6 @@ class StackFr3WristCamEnv(RealFr3WristCam):
                 or set reconfiguration_freq to be >= 1."""
             )
 
-        self._objs: List[Actor] = []
         self.obj_heights = []
         
         model_ids = ["005_tomato_soup_can"]
@@ -131,7 +129,7 @@ class StackFr3WristCamEnv(RealFr3WristCam):
                         
                         pose = torch.tensor(init_state['actor_poses'][red_can_key]).to(self.device).float()
                         obj_xyz_0 = pose[:3].unsqueeze(0).repeat(b, 1)
-                        red_can_rotate_fix = pose[3:7].unsqueeze(0).repeat(b, 1)
+                        obj_qs_0 = pose[3:7].unsqueeze(0).repeat(b, 1)
                         
                         pose_g = torch.tensor(init_state['actor_poses'][goal_key]).to(self.device).float()
                         goal_xyz_0 = pose_g[:3].unsqueeze(0).repeat(b, 1)
@@ -144,28 +142,30 @@ class StackFr3WristCamEnv(RealFr3WristCam):
                 print("Initializing episode with RANDOM init poses of robot and objects!")
 
                 # generate random initial positions since they are not in init_state
-                red_can_rotate_fix = quaternion_multiply(
-                    axis_angle_to_quaternion(axis_angle=torch.tensor([0.0, 0.0, torch.pi / 4])), 
-                    axis_angle_to_quaternion(axis_angle=torch.tensor([torch.pi / 2, 0.0, 0.0]))
-                )
+                # The red can mesh needs a 90 deg rotation around X to stand upright.
+                # We then apply a random rotation around the Z axis to randomize its yaw.
+                base_upright_q = axis_angle_to_quaternion(torch.tensor([torch.pi / 2, 0.0, 0.0])).unsqueeze(0).repeat(b, 1)
+                random_z_q = random_quaternions(b, lock_x=True, lock_y=True)
+                obj_qs_0 = quaternion_multiply(random_z_q, base_upright_q)
                 
                 obj_xyz_0 = torch.zeros((b, 3))
-                obj_xyz_0[:, 0] = -0.125 + torch.rand(b) * 0.125 + self.x_offset # 0 to -0.25
-                obj_xyz_0[:, 1] = 0.1 + abs(torch.rand((b))) * 0.1    #-0.2 to 0
+                obj_xyz_0[:, 0] = self.x_offset -0.22 + torch.rand(b) * 0.05
+                obj_xyz_0[:, 1] = -0.05 + torch.rand(b) * 0.1
                 obj_xyz_0[:, 2] = self.obj_height
-                obj_qs_0 = random_quaternions(b, lock_x=True, lock_y=True)
 
                 goal_xyz_0 = torch.zeros((b, 3))
-                goal_xyz_0[:, 0] = torch.rand((b)) * 0.2 - 0.25 + self.x_offset 
-                goal_xyz_0[:, 1] = obj_xyz_0[:, 1] - 0.15 - abs(torch.rand((b))) * 0.1  # seperate by 0.15 to 0.25
+                radius = 0.2
+                theta = torch.rand((b)) * 2 * math.pi
+                goal_xyz_0[:, 0] = obj_xyz_0[:, 0] + radius * torch.cos(theta)
+                goal_xyz_0[:, 1] = obj_xyz_0[:, 1] + radius * torch.sin(theta)
                 goal_xyz_0[:, 2] = self.goal_height
-
                 goal_qs = random_quaternions(b, lock_x=True, lock_y=True)
-                obj_xyz_0[:, :2], goal_xyz_0[:, :2] = goal_xyz_0[:, :2].clone(), obj_xyz_0[:, :2].clone()
+                
                 print(f"obj pose {obj_xyz_0} {obj_qs_0}, goal pose {goal_xyz_0} {goal_qs}")
 
                 # Set Robot Pose
                 init_qpos = FR3_HIGH_INIT_QPOS.copy()
+                # TODO put uniform instead of gaussian 
                 init_qpos[:-2] += self._episode_rng.normal(
                     0, self.robot_init_qpos_noise, len(init_qpos) - 2
                 )
@@ -173,7 +173,7 @@ class StackFr3WristCamEnv(RealFr3WristCam):
                 self.agent.robot.set_root_pose(sapien.Pose([self.x_offset-0.615, 0, 0]))
 
             # Set init poses
-            self._objs[0].set_pose(Pose.create_from_pq(p=obj_xyz_0, q=red_can_rotate_fix))
+            self._objs[0].set_pose(Pose.create_from_pq(p=obj_xyz_0, q=obj_qs_0))
             self.goal_site.set_pose(Pose.create_from_pq(p=goal_xyz_0, q=goal_qs))  # Red can (cylinder)
 
             self.agent.reset(init_qpos)
