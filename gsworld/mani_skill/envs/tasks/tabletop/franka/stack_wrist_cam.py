@@ -109,7 +109,6 @@ class StackFr3WristCamEnv(RealFr3WristCam):
 
     def _initialize_episode(self, env_idx: torch.Tensor, options: dict):
         with torch.device(self.device):
-            from transforms3d.euler import euler2quat
             import math
             
             b = len(env_idx)
@@ -141,12 +140,17 @@ class StackFr3WristCamEnv(RealFr3WristCam):
             if not using_dataset_poses:
                 print("Initializing episode with RANDOM init poses of robot and objects!")
 
-                # generate random initial positions since they are not in init_state
                 # The red can mesh needs a 90 deg rotation around X to stand upright.
                 # We then apply a random rotation around the Z axis to randomize its yaw.
                 base_upright_q = axis_angle_to_quaternion(torch.tensor([torch.pi / 2, 0.0, 0.0])).unsqueeze(0).repeat(b, 1)
                 random_z_q = random_quaternions(b, lock_x=True, lock_y=True)
                 obj_qs_0 = quaternion_multiply(random_z_q, base_upright_q)
+
+                # applying fixed init rotation around z
+                # obj_qs_0 = quaternion_multiply(
+                #     axis_angle_to_quaternion(axis_angle=torch.tensor([0.0, 0.0, torch.pi / 4])), 
+                #     axis_angle_to_quaternion(axis_angle=torch.tensor([torch.pi / 2, 0.0, 0.0]))
+                # )
                 
                 obj_xyz_0 = torch.zeros((b, 3))
                 obj_xyz_0[:, 0] = self.x_offset -0.22 + torch.rand(b) * 0.05

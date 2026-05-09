@@ -344,7 +344,7 @@ sim2gs_object_transforms = {
 # fine-tuning gs alignment
 object_offset = {
     # "006_mustard_bottle": [-0.02, 0.01, 0.02],
-    "005_tomato_soup_can": [0.0, 0.0, 0.01],
+    "005_tomato_soup_can": [0.0, 0.0, 0.00],
     "005_tomato_soup_can_fr3": [0.0, 0.0, 0.0],
     "005_tomato_soup_can-0": [0.0, 0.0, 0.04], # stack goal
     "005_tomato_soup_can-1": [0.0, 0.0, 0.01],
@@ -365,7 +365,7 @@ object_offset = {
     "dtc_green_can": [-0.04, 0.0, -0.03],
     "dtc_green_can_fr3": [-0.04, 0.0, 0.0],
     "dtc_red_tomato_can": [0.0, -0.015, 0.04],
-    "dtc_red_tomato_can_fr3": [0.0, 0., 0.0],
+    "dtc_red_tomato_can_fr3": [0.0, 0.003, 0.0],
     "bread_slice": [0.0, 0.0, 0.04],
     "dtc:Kitchen_Spoon_B008H2JLP8_LargeWooden": [0.0, 0.0, 0.0],
 }
