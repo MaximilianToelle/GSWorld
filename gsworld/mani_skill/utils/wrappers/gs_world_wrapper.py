@@ -178,6 +178,22 @@ class GSWorldWrapper(gym.Wrapper):
             time.sleep(1)
             server.on_client_connect(partial(_on_connect, server=server, scene_center=scene_center))
 
+            # Possibility to overwrite colors of Gaussians for logging / debugging
+            self.gs_features_dc_overwrite = None 
+
+    def overwrite_gs_rgb_for_rendering(self, gs_rgb_overwrite):
+        """
+            Takes *normalized* rgb color values of all Gaussians
+            transforms to dc features and 
+            stores in self.gs_features_dc_overwrite for later use during rendering
+        """
+
+        assert gs_rgb_overwrite.shape[-1] == 3, "Need to provide 3-channel, RGB values!"
+        assert gs_rgb_overwrite.max() <= 1.0 and gs_rgb_overwrite.min() >= 0.0, "RGB values need to be normalized!"
+
+        features_dc = (gs_rgb_overwrite - 0.5) / self.SH_C0
+        self.gs_features_dc_overwrite = features_dc
+
     def transform_gs_perlink(self, splats, gs_init_qpos=None, target_mat=None, eef_pos=None):
         """Transform gaussian splatting model based on robot joint states"""
         transformed_splats = copy.deepcopy(splats)
@@ -376,6 +392,11 @@ class GSWorldWrapper(gym.Wrapper):
                             gs4render._rotation[mask] = self.gs_movable_pts[key][2][i]
                         if self.gs_movable_pts[key][3].shape[0] == self.num_envs:
                             gs4render._opacity[mask] = self.gs_movable_pts[key][3][i]
+                    if self.gs_features_dc_overwrite is not None:
+                        overwrite_dc = self.gs_features_dc_overwrite
+                        if overwrite_dc.ndim == 2 and gs4render._features_dc.ndim == 3:
+                            overwrite_dc = overwrite_dc.unsqueeze(1)
+                        gs4render._features_dc = overwrite_dc
                     output = render(cam_param, gs4render, self.robot_pipe, background, 
                                     use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
                     rendering = output["render"].detach()
