@@ -203,22 +203,62 @@ class WristCamGSWorldWrapper(gym.Wrapper):
             self.server = viser.ViserServer(port=8081, verbose=False)
             self.server.on_client_connect(partial(_on_connect, server=self.server))
 
-        # Possibility to overwrite colors of Gaussians for logging / debugging
-        self.gs_features_dc_overwrite = None 
+        # Overwrite gs params - the variables are built from the original model before overwriting 
+        self.gs_features_dc_overwrite = None
+        self.gs_opacity_overwrite = None
 
-    def overwrite_gs_rgb_for_rendering(self, gs_rgb_overwrite):
+    def overwrite_gs_rgb_for_rendering(self, gs_rgb_overwrite, indices=None):
         """
-            Takes *normalized* rgb color values
-            transforms to dc features and 
-            stores in self.gs_features_dc_overwrite for later use during rendering
-        """
+        Overwrites RGB colors at the given indices in the full Gaussian scene.
+        If indices stays None, gs_rgb_overwrite needs to provide color values for all Gaussians.
+        The buffer is rebuilt from the original model before overwriting.
 
+        Args:
+            gs_rgb_overwrite: (M, 3) normalized RGB values in [0, 1]
+            indices: (M,) indices into the full Gaussian scene
+        """
         assert gs_rgb_overwrite.shape[-1] == 3, "Need to provide 3-channel, RGB values!"
-        assert gs_rgb_overwrite.max() <= 1.0 and gs_rgb_overwrite.min() >= 0.0, "RGB values need to be normalized!"
+        assert gs_rgb_overwrite.max() <= 1.0 and gs_rgb_overwrite.min() >= 0.0, "RGB values need to be normalized to [0.0, 1.0]!"
 
-        features_dc = (gs_rgb_overwrite - 0.5) / self.SH_C0
-        self.gs_features_dc_overwrite = features_dc
+        self.gs_features_dc_overwrite = self.merged_init_gaussian_models._features_dc.clone().detach()
+        features_dc = ((gs_rgb_overwrite - 0.5) / self.SH_C0).unsqueeze(1)  # (M, 1, 3)
+        if indices is None:
+            N_total = self.merged_init_gaussian_models._features_dc.shape[0]
+            assert gs_rgb_overwrite.shape[0] == N_total, f"When indices is None, must provide RGB for all {N_total} Gaussians, got {gs_rgb_overwrite.shape[0]}!"
+            self.gs_features_dc_overwrite = features_dc
+        else:
+            assert indices.shape[0] == gs_rgb_overwrite.shape[0], f"Number of indices ({indices.shape[0]}) must match number of RGB values ({gs_rgb_overwrite.shape[0]})!"
+            self.gs_features_dc_overwrite[indices] = features_dc
 
+    def overwrite_gs_opacity_for_rendering(self, opacity, indices=None):
+        """
+        Overwrites opacity at the given indices in the full Gaussian scene.
+        The buffer is rebuilt from the original model before overwriting.
+
+        Args:
+            opacity: (M,) or (M, 1) tensor with opacity values in [0.0, 1.0]
+            indices: (M,) indices into the full Gaussian scene
+        """
+        assert opacity.max() <= 1.0 and opacity.min() >= 0.0, "Opacity values must be in [0.0, 1.0]!"
+
+        # Convert [0, 1] opacity to logit space (pre-sigmoid)
+        opacity_logit = torch.logit(opacity)
+        if opacity_logit.ndim == 1:
+            opacity_logit = opacity_logit.unsqueeze(-1)  # (M,) -> (M, 1)
+
+        self.gs_opacity_overwrite = self.merged_init_gaussian_models._opacity.clone().detach()
+        if indices is None:
+            N_total = self.merged_init_gaussian_models._opacity.shape[0]
+            assert opacity.shape[0] == N_total, f"When indices is None, must provide opacity for all {N_total} Gaussians, got {opacity.shape[0]}!"
+            self.gs_opacity_overwrite = opacity_logit
+        else:
+            assert indices.shape[0] == opacity.shape[0], f"Number of indices ({indices.shape[0]}) must match number of opacity values ({opacity.shape[0]})!"
+            self.gs_opacity_overwrite[indices] = opacity_logit
+
+    def reset_overwritten_gs_params():
+        self.gs_features_dc_overwrite = None
+        self.gs_opacity_overwrite = None
+    
     def transform_gs_perlink(self, splats, gs_init_qpos=None, target_mat=None, eef_pos=None):
         """Transform gaussian splatting model based on robot joint states"""
         transformed_splats = copy.deepcopy(splats)
@@ -589,10 +629,9 @@ class WristCamGSWorldWrapper(gym.Wrapper):
                         if self.moving_gaussians[key][3].shape[0] == self.num_envs:
                             gs4render._opacity[mask] = self.moving_gaussians[key][3][i]
                     if self.gs_features_dc_overwrite is not None:
-                        overwrite_dc = self.gs_features_dc_overwrite
-                        if overwrite_dc.ndim == 2 and gs4render._features_dc.ndim == 3:
-                            overwrite_dc = overwrite_dc.unsqueeze(1)
-                        gs4render._features_dc = overwrite_dc
+                        gs4render._features_dc = self.gs_features_dc_overwrite
+                    if self.gs_opacity_overwrite is not None:
+                        gs4render._opacity = self.gs_opacity_overwrite
                     output = render(cam_param, gs4render, self.robot_pipe, background, 
                                     use_trained_exp=False, separate_sh=SPARSE_ADAM_AVAILABLE)
                     rendering = output["render"].detach()
